@@ -42,10 +42,12 @@ func (r *PlaylistRepository) Create(ctx context.Context, playlist *models.Playli
 	}
 
 	return r.runInTx(ctx, func(dbtx sqlc.DBTX, q *sqlc.Queries) error {
-		if _, err := q.FindPlaylistByName(ctx, playlist.Name); err == nil {
+		exists, err := playlistNameTaken(ctx, dbtx, playlist.Name, playlist.OwnerUserID, 0)
+		if err != nil {
+			return err
+		}
+		if exists {
 			return models.ErrPlaylistNameConflict
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("check existing playlist: %w", err)
 		}
 
 		maxPos, err := q.GetMaxPlaylistPosition(ctx)
@@ -53,17 +55,33 @@ func (r *PlaylistRepository) Create(ctx context.Context, playlist *models.Playli
 			return fmt.Errorf("get max position: %w", err)
 		}
 
-		id, err := q.CreatePlaylist(ctx, sqlc.CreatePlaylistParams{
-			Type:        playlist.Type,
-			Name:        playlist.Name,
-			Description: playlist.Description,
-			CoverPath:   playlist.CoverPath,
-			CoverUrl:    playlist.CoverURL,
-			Labels:      string(labelsJSON),
-			Position:    maxPos + 1,
-		})
+		// owner_user_id 必须在 INSERT 时写入：若先插 NULL 再 UPDATE，会与全局同名
+		// （如内置「收藏」）撞上 idx_playlists_global_name。
+		var owner any
+		if playlist.OwnerUserID != nil {
+			owner = *playlist.OwnerUserID
+		}
+		res, err := dbtx.ExecContext(ctx, `
+			INSERT INTO playlists (type, name, description, cover_path, cover_url, labels, position, owner_user_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			playlist.Type,
+			playlist.Name,
+			playlist.Description,
+			playlist.CoverPath,
+			playlist.CoverURL,
+			string(labelsJSON),
+			maxPos+1,
+			owner,
+		)
 		if err != nil {
+			if isUniqueViolation(err) {
+				return models.ErrPlaylistNameConflict
+			}
 			return fmt.Errorf("insert playlist: %w", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("last insert id: %w", err)
 		}
 
 		now := time.Now()
@@ -86,7 +104,11 @@ func (r *PlaylistRepository) GetByID(ctx context.Context, id int64) (*models.Pla
 		}
 		return nil, fmt.Errorf("get playlist %d: %w", id, err)
 	}
-	return playlistRowToModel(row), nil
+	p := playlistRowToModel(row)
+	if err := r.loadPlaylistOwner(ctx, p); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // FindByName 按名称精确查找歌单，找不到返回 ErrNotFound。
@@ -110,13 +132,12 @@ func (r *PlaylistRepository) Update(ctx context.Context, playlist *models.Playli
 
 	now := time.Now()
 	return r.runInTx(ctx, func(dbtx sqlc.DBTX, q *sqlc.Queries) error {
-		if _, err := q.FindPlaylistByNameExcludeID(ctx, sqlc.FindPlaylistByNameExcludeIDParams{
-			Name: playlist.Name,
-			ID:   playlist.ID,
-		}); err == nil {
+		exists, err := playlistNameTaken(ctx, dbtx, playlist.Name, playlist.OwnerUserID, playlist.ID)
+		if err != nil {
+			return err
+		}
+		if exists {
 			return models.ErrPlaylistNameConflict
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("check existing playlist: %w", err)
 		}
 
 		rows, err := q.UpdatePlaylist(ctx, sqlc.UpdatePlaylistParams{
@@ -725,6 +746,7 @@ func playlistSelectBuilder() sq.SelectBuilder {
 		"p.created_at", "p.updated_at",
 		"COALESCE(cnt.song_count, 0) AS song_count",
 		"COALESCE(cnt.remote_count, 0) AS remote_count",
+		"p.owner_user_id",
 	).From("playlists p").
 		// 子查询 JOIN songs 只为多算一个 remote_count（网络歌单徽标用）。
 		// song_count 语义不受影响：foreign_keys(1) 已开 + playlist_songs.song_id
@@ -751,6 +773,9 @@ func applyPlaylistFilter(sb sq.SelectBuilder, filter *PlaylistFilter, prefix str
 			sq.Like{prefix + "name": kw},
 			sq.Like{prefix + "description": kw},
 		})
+	}
+	if filter.OwnerUserID != nil {
+		sb = sb.Where(sq.Eq{prefix + "owner_user_id": *filter.OwnerUserID})
 	}
 	// SongSource 是 EXISTS 语义（含该来源的歌曲即命中），故混合歌单同时命中
 	// remote 与 local，空歌单两者都不命中。
@@ -779,11 +804,13 @@ func scanPlaylistRow(scanner interface {
 	var pinnedAt sql.NullTime
 	var songCount int64
 	var remoteCount int64
+	var ownerUserID sql.NullInt64
 	if err := scanner.Scan(
 		&p.ID, &p.Type, &p.Name, &p.Description,
 		&p.CoverPath, &p.CoverURL, &labelsJSON,
 		&p.SortBy, &p.SortOrder, &pinnedAt,
 		&p.CreatedAt, &p.UpdatedAt, &songCount, &remoteCount,
+		&ownerUserID,
 	); err != nil {
 		return nil, fmt.Errorf("scan playlist: %w", err)
 	}
@@ -793,7 +820,54 @@ func scanPlaylistRow(scanner interface {
 	if pinnedAt.Valid {
 		p.PinnedAt = &pinnedAt.Time
 	}
+	if ownerUserID.Valid {
+		id := ownerUserID.Int64
+		p.OwnerUserID = &id
+	}
 	return p, nil
+}
+
+func (r *PlaylistRepository) loadPlaylistOwner(ctx context.Context, p *models.Playlist) error {
+	var ownerUserID sql.NullInt64
+	if err := r.db.QueryRowContext(ctx, `SELECT owner_user_id FROM playlists WHERE id = ?`, p.ID).Scan(&ownerUserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("load playlist owner: %w", err)
+	}
+	if ownerUserID.Valid {
+		id := ownerUserID.Int64
+		p.OwnerUserID = &id
+	}
+	return nil
+}
+
+// playlistNameTaken 检查同名是否在同一 owner 作用域内已存在。
+// excludeID>0 时排除自身（更新场景）。
+func playlistNameTaken(ctx context.Context, db sqlc.DBTX, name string, ownerUserID *int64, excludeID int64) (bool, error) {
+	var q string
+	var args []any
+	if ownerUserID == nil {
+		q = `SELECT 1 FROM playlists WHERE name = ? AND owner_user_id IS NULL`
+		args = []any{name}
+	} else {
+		q = `SELECT 1 FROM playlists WHERE name = ? AND owner_user_id = ?`
+		args = []any{name, *ownerUserID}
+	}
+	if excludeID > 0 {
+		q += ` AND id != ?`
+		args = append(args, excludeID)
+	}
+	q += ` LIMIT 1`
+	var one int
+	err := db.QueryRowContext(ctx, q, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check playlist name: %w", err)
+	}
+	return true, nil
 }
 
 func playlistRowToModel(row sqlc.GetPlaylistByIDRow) *models.Playlist {

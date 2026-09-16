@@ -53,10 +53,12 @@ type PlaylistFilter struct {
 	// 语义是 EXISTS 而非「全部是」：混合歌单两边都命中，空歌单两边都不命中
 	// （来源未知，归任何一边都是编的）。歌单本身没有来源字段，只能这样反推（songloft-org/songloft#445）。
 	SongSource string
-	Limit      int
-	Offset     int
-	OrderBy    string
-	Order      string
+	// OwnerUserID 非 nil 时仅返回该用户的歌单（listener 列表隔离用）。
+	OwnerUserID *int64
+	Limit       int
+	Offset      int
+	OrderBy     string
+	Order       string
 }
 
 // PlaylistSongFilter 歌单歌曲过滤/排序条件
@@ -83,6 +85,7 @@ type FacetFilter struct {
 // TokenFilter Token 过滤条件
 type TokenFilter struct {
 	TokenType string
+	UserID    int64 // >0 时仅返回该用户的令牌
 	IsActive  *bool
 	Keyword   string
 	Limit     int

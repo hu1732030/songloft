@@ -4,14 +4,28 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
 
 	"songloft/internal/database"
 	"songloft/internal/models"
+)
+
+const (
+	accessTokenTTL  = 30 * 24 * time.Hour // Access Token 有效期
+	refreshTokenTTL = 45 * 24 * time.Hour // Refresh Token 有效期
+	guestTokenTTL   = 30 * time.Minute    // 游客试听 Access Token 有效期
+	bcryptCost      = bcrypt.DefaultCost
+	minPasswordLen  = 4
+	maxUsernameLen  = 64
+	pluginClientID  = "plugin-system"
 )
 
 // TokenRepository 认证令牌仓储接口（AuthService 依赖）。
@@ -24,6 +38,18 @@ type TokenRepository interface {
 	IsRevoked(ctx context.Context, tokenID string) (bool, error)
 }
 
+// UserRepository 用户仓储接口（AuthService 依赖）。
+type UserRepository interface {
+	Create(ctx context.Context, user *models.User) error
+	GetByID(ctx context.Context, id int64) (*models.User, error)
+	GetByUsername(ctx context.Context, username string) (*models.User, error)
+	CountAdmins(ctx context.Context) (int64, error)
+	UpdatePassword(ctx context.Context, id int64, passwordHash string) error
+	UpdateStatus(ctx context.Context, id int64, status string) error
+	List(ctx context.Context, filter *database.UserFilter) ([]*models.User, error)
+	Count(ctx context.Context, filter *database.UserFilter) (int64, error)
+}
+
 // TokenCacheEntry Token 缓存条目
 type TokenCacheEntry struct {
 	Claims    *Claims
@@ -33,10 +59,11 @@ type TokenCacheEntry struct {
 
 // AuthService 认证服务
 type AuthService struct {
-	tokens   TokenRepository
-	secret   []byte
-	username string
-	password string
+	tokens TokenRepository
+	users  UserRepository
+	secret []byte
+	// onUserCreated 新用户创建后的钩子（如种子个人收藏歌单）
+	onUserCreated func(ctx context.Context, userID int64) error
 	// Token 内存缓存，key 为 token 字符串，value 为缓存条目
 	tokenCache sync.Map // map[string]*TokenCacheEntry
 	done       chan struct{}
@@ -46,6 +73,9 @@ type AuthService struct {
 // Claims JWT声明结构
 type Claims struct {
 	ClientID string `json:"client_id"`
+	UserID   int64  `json:"user_id,omitempty"`
+	Role     string `json:"role,omitempty"`
+	Username string `json:"username,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -55,34 +85,69 @@ type RefreshResponse struct {
 	RefreshToken string `json:"refresh_token"`
 	ExpiresIn    int64  `json:"expires_in"`
 	TokenType    string `json:"token_type"`
+	UserID       int64  `json:"user_id"`
+	Username     string `json:"username"`
+	Role         string `json:"role"`
 }
 
-// NewAuthService 创建认证服务
-func NewAuthService(configs ConfigRepository, tokens TokenRepository, username, password string) (*AuthService, error) {
-	// 从数据库获取 JWT 密钥
+// NewAuthService 创建认证服务（凭证一律查 users 表）。
+func NewAuthService(configs ConfigRepository, tokens TokenRepository, users UserRepository) (*AuthService, error) {
 	config, err := configs.Get(context.Background(), "jwt_secret")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get jwt secret: %w", err)
 	}
 
-	// 解码密钥
 	secret, err := hex.DecodeString(config.Value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode jwt secret: %w", err)
 	}
 
 	s := &AuthService{
-		tokens:   tokens,
-		secret:   secret,
-		username: username,
-		password: password,
-		done:     make(chan struct{}),
+		tokens: tokens,
+		users:  users,
+		secret: secret,
+		done:   make(chan struct{}),
 	}
-
-	// 启动缓存清理协程
 	go s.startCacheCleanup()
-
 	return s, nil
+}
+
+// SetOnUserCreated 注册新用户创建后的钩子。
+func (s *AuthService) SetOnUserCreated(fn func(ctx context.Context, userID int64) error) {
+	s.onUserCreated = fn
+}
+
+// EnsureAdminUser 若库中尚无 admin，则用给定凭证 bcrypt 后写入一条。
+// 已存在 admin 时不覆盖密码。
+func EnsureAdminUser(ctx context.Context, users UserRepository, username, password string) error {
+	n, err := users.CountAdmins(ctx)
+	if err != nil {
+		return fmt.Errorf("count admins: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		username = "admin"
+	}
+	if password == "" {
+		password = "admin"
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
+	user := &models.User{
+		Username:     username,
+		PasswordHash: hash,
+		Role:         models.UserRoleAdmin,
+		Status:       models.UserStatusActive,
+	}
+	if err := users.Create(ctx, user); err != nil {
+		return fmt.Errorf("seed admin user: %w", err)
+	}
+	return nil
 }
 
 // GenerateSecret 生成新的 JWT 密钥
@@ -94,78 +159,40 @@ func GenerateSecret() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-// getAdminUsername 获取管理员用户名
-func (s *AuthService) getAdminUsername(ctx context.Context) (string, error) {
-	return s.username, nil
-}
-
-// getAdminPassword 获取管理员密码
-func (s *AuthService) getAdminPassword(ctx context.Context) (string, error) {
-	return s.password, nil
-}
-
-// Login 用户登录
+// Login 用户登录（查库校验 bcrypt）。
 func (s *AuthService) Login(ctx context.Context, username, password, clientInfo string) (*models.LoginResponse, error) {
-	// 从数据库获取管理员账户信息
-	adminUsername, err := s.getAdminUsername(ctx)
+	user, err := s.users.GetByUsername(ctx, strings.TrimSpace(username))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get admin username: %w", err)
+		if errors.Is(err, database.ErrNotFound) {
+			return nil, models.ErrInvalidCredentials
+		}
+		return nil, fmt.Errorf("get user: %w", err)
+	}
+	if user.Status != models.UserStatusActive {
+		return nil, models.ErrUserDisabled
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+		return nil, models.ErrInvalidCredentials
 	}
 
-	adminPassword, err := s.getAdminPassword(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get admin password: %w", err)
-	}
-
-	if username != adminUsername || password != adminPassword {
-		return nil, fmt.Errorf("invalid credentials")
-	}
-
-	// 生成客户端 ID
 	clientID, err := generateClientID()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate client id: %w", err)
 	}
 
-	// 生成 Access Token (7 天过期)
-	accessToken, accessExp, err := s.generateToken(clientID, "access", 7*24*time.Hour)
+	accessToken, accessExp, err := s.generateToken(user, clientID, accessTokenTTL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate access token: %w", err)
 	}
-
-	// 生成 Refresh Token (30 天过期)
-	refreshToken, refreshExp, err := s.generateToken(clientID, "refresh", 30*24*time.Hour)
+	refreshToken, refreshExp, err := s.generateToken(user, clientID, refreshTokenTTL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate refresh token: %w", err)
 	}
 
-	// 保存 Token 到数据库
 	now := time.Now()
-	accessRecord := &models.AuthToken{
-		TokenID:    accessToken,
-		TokenType:  "access",
-		ClientInfo: clientInfo,
-		ExpiresAt:  accessExp,
-		CreatedAt:  now,
+	if err := s.persistTokenPair(ctx, user.ID, accessToken, refreshToken, clientInfo, accessExp, refreshExp, now); err != nil {
+		return nil, err
 	}
-
-	refreshRecord := &models.AuthToken{
-		TokenID:    refreshToken,
-		TokenType:  "refresh",
-		ClientInfo: clientInfo,
-		ExpiresAt:  refreshExp,
-		CreatedAt:  now,
-	}
-
-	if err := s.tokens.Create(ctx, accessRecord); err != nil {
-		return nil, fmt.Errorf("failed to save access token: %w", err)
-	}
-
-	if err := s.tokens.Create(ctx, refreshRecord); err != nil {
-		return nil, fmt.Errorf("failed to save refresh token: %w", err)
-	}
-
-	// 清理过期 Token
 	_, _ = s.tokens.CleanExpired(ctx)
 
 	return &models.LoginResponse{
@@ -173,24 +200,183 @@ func (s *AuthService) Login(ctx context.Context, username, password, clientInfo 
 		RefreshToken: refreshToken,
 		ExpiresIn:    int64(accessExp.Sub(now).Seconds()),
 		TokenType:    "Bearer",
+		UserID:       user.ID,
+		Username:     user.Username,
+		Role:         user.Role,
 	}, nil
+}
+
+// GuestLogin 签发游客试听令牌：30 分钟、无 refresh、不落 users 表（只听不留痕）。
+func (s *AuthService) GuestLogin(ctx context.Context, clientInfo string) (*models.LoginResponse, error) {
+	clientID, err := generateClientID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate client id: %w", err)
+	}
+	guest := &models.User{
+		ID:       0,
+		Username: "guest",
+		Role:     models.UserRoleGuest,
+		Status:   models.UserStatusActive,
+	}
+	accessToken, accessExp, err := s.generateToken(guest, clientID, guestTokenTTL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate guest token: %w", err)
+	}
+	now := time.Now()
+	accessRecord := &models.AuthToken{
+		TokenID:    accessToken,
+		TokenType:  "access",
+		ClientInfo: clientInfo,
+		UserID:     0,
+		ExpiresAt:  accessExp,
+		CreatedAt:  now,
+	}
+	if err := s.tokens.Create(ctx, accessRecord); err != nil {
+		return nil, fmt.Errorf("failed to save guest token: %w", err)
+	}
+	_, _ = s.tokens.CleanExpired(ctx)
+
+	return &models.LoginResponse{
+		AccessToken:  accessToken,
+		RefreshToken: "",
+		ExpiresIn:    int64(accessExp.Sub(now).Seconds()),
+		TokenType:    "Bearer",
+		UserID:       0,
+		Username:     guest.Username,
+		Role:         models.UserRoleGuest,
+	}, nil
+}
+
+// Register 注册 listener 账号并直接登录返回令牌。
+func (s *AuthService) Register(ctx context.Context, username, password, clientInfo string) (*models.LoginResponse, error) {
+	username = strings.TrimSpace(username)
+	if err := validateUsername(username); err != nil {
+		return nil, err
+	}
+	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+	user := &models.User{
+		Username:     username,
+		PasswordHash: hash,
+		Role:         models.UserRoleListener,
+		Status:       models.UserStatusActive,
+	}
+	if err := s.users.Create(ctx, user); err != nil {
+		return nil, err
+	}
+	if s.onUserCreated != nil {
+		if err := s.onUserCreated(ctx, user.ID); err != nil {
+			return nil, fmt.Errorf("seed user playlists: %w", err)
+		}
+	}
+	return s.Login(ctx, username, password, clientInfo)
+}
+
+// ChangePassword 修改当前用户密码。
+func (s *AuthService) ChangePassword(ctx context.Context, userID int64, oldPassword, newPassword string) error {
+	if err := validatePassword(newPassword); err != nil {
+		return err
+	}
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(oldPassword)); err != nil {
+		return models.ErrInvalidCredentials
+	}
+	hash, err := hashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	return s.users.UpdatePassword(ctx, userID, hash)
+}
+
+// ListUsers 分页列出用户（供 admin）。
+func (s *AuthService) ListUsers(ctx context.Context, filter *database.UserFilter) ([]*models.User, int64, error) {
+	items, err := s.users.List(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.users.Count(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+// AdminResetPassword 管理员重置指定用户密码，并撤销该用户全部活跃令牌。
+func (s *AuthService) AdminResetPassword(ctx context.Context, userID int64, newPassword string) error {
+	if err := validatePassword(newPassword); err != nil {
+		return err
+	}
+	if _, err := s.users.GetByID(ctx, userID); err != nil {
+		return err
+	}
+	hash, err := hashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	if err := s.users.UpdatePassword(ctx, userID, hash); err != nil {
+		return err
+	}
+	return s.revokeUserTokens(ctx, userID, "admin", "password_reset")
+}
+
+// AdminSetUserStatus 管理员启用/禁用用户；禁止禁用 role=admin。
+func (s *AuthService) AdminSetUserStatus(ctx context.Context, userID int64, status string) error {
+	switch status {
+	case models.UserStatusActive, models.UserStatusDisabled:
+	default:
+		return fmt.Errorf("invalid status %q", status)
+	}
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if status == models.UserStatusDisabled && user.Role == models.UserRoleAdmin {
+		return models.ErrCannotDisableAdmin
+	}
+	if err := s.users.UpdateStatus(ctx, userID, status); err != nil {
+		return err
+	}
+	if status == models.UserStatusDisabled {
+		return s.revokeUserTokens(ctx, userID, "admin", "user_disabled")
+	}
+	return nil
+}
+
+func (s *AuthService) revokeUserTokens(ctx context.Context, userID int64, revokedBy, reason string) error {
+	tokens, err := s.tokens.ListActive(ctx, &database.TokenFilter{
+		UserID: userID,
+		Limit:  10000,
+	})
+	if err != nil {
+		return err
+	}
+	for _, t := range tokens {
+		_ = s.tokens.Revoke(ctx, t.TokenID, revokedBy, reason)
+		s.deleteTokenCache(t.TokenID)
+	}
+	return nil
 }
 
 // getCachedToken 从缓存获取 Token 信息
 func (s *AuthService) getCachedToken(tokenString string) (*TokenCacheEntry, bool) {
 	if entry, ok := s.tokenCache.Load(tokenString); ok {
 		cacheEntry := entry.(*TokenCacheEntry)
-		// 检查缓存是否过期
 		if time.Now().Before(cacheEntry.ExpiresAt) && !cacheEntry.Revoked {
 			return cacheEntry, true
 		}
-		// 缓存已过期，删除它
 		s.tokenCache.Delete(tokenString)
 	}
 	return nil, false
 }
 
-// setTokenCache 设置 Token 缓存
 func (s *AuthService) setTokenCache(tokenString string, claims *Claims, expiresAt time.Time, revoked bool) {
 	s.tokenCache.Store(tokenString, &TokenCacheEntry{
 		Claims:    claims,
@@ -199,7 +385,6 @@ func (s *AuthService) setTokenCache(tokenString string, claims *Claims, expiresA
 	})
 }
 
-// deleteTokenCache 删除 Token 缓存
 func (s *AuthService) deleteTokenCache(tokenString string) {
 	s.tokenCache.Delete(tokenString)
 }
@@ -211,18 +396,15 @@ func (s *AuthService) Close() {
 	})
 }
 
-// startCacheCleanup 启动缓存清理协程，每分钟清理一次过期缓存
 func (s *AuthService) startCacheCleanup() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
 			now := time.Now()
 			s.tokenCache.Range(func(key, value interface{}) bool {
 				entry := value.(*TokenCacheEntry)
-				// 如果缓存已过期或 token 已被撤销，删除它
 				if now.After(entry.ExpiresAt) || entry.Revoked {
 					s.tokenCache.Delete(key)
 				}
@@ -234,110 +416,97 @@ func (s *AuthService) startCacheCleanup() {
 	}
 }
 
-// Logout 用户登出
+// Logout 用户登出。clientID 为 JWT 内 client_id，用于配对撤销同会话 refresh token。
 func (s *AuthService) Logout(ctx context.Context, accessToken, clientID string) error {
-	// 撤销 Access Token
-	if err := s.tokens.Revoke(ctx, accessToken, clientID, "logout"); err != nil {
+	revoker := clientID
+	if revoker == "" {
+		revoker = "user"
+	}
+	if err := s.tokens.Revoke(ctx, accessToken, revoker, "logout"); err != nil {
 		return fmt.Errorf("failed to revoke access token: %w", err)
 	}
-	// 清除缓存
 	s.deleteTokenCache(accessToken)
 
-	// 查找并撤销对应的 Refresh Token
-	filter := &database.TokenFilter{
-		TokenType: "refresh",
+	if clientID == "" {
+		return nil
 	}
 
+	filter := &database.TokenFilter{TokenType: "refresh"}
 	tokens, err := s.tokens.ListActive(ctx, filter)
 	if err != nil {
 		return fmt.Errorf("failed to list refresh tokens: %w", err)
 	}
-
 	for _, token := range tokens {
-		// 检查是否属于同一客户端
-		if token.ClientInfo == clientID {
-			if err := s.tokens.Revoke(ctx, token.TokenID, clientID, "logout"); err != nil {
-				return fmt.Errorf("failed to revoke refresh token: %w", err)
-			}
-			// 清除缓存
-			s.deleteTokenCache(token.TokenID)
+		claims, err := s.parseClaimsUnchecked(token.TokenID)
+		if err != nil || claims.ClientID != clientID {
+			continue
 		}
+		if err := s.tokens.Revoke(ctx, token.TokenID, revoker, "logout"); err != nil {
+			return fmt.Errorf("failed to revoke refresh token: %w", err)
+		}
+		s.deleteTokenCache(token.TokenID)
 	}
-
 	return nil
 }
 
 // RefreshToken 刷新Token
 func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, clientInfo string) (*RefreshResponse, error) {
-	// 验证Refresh Token
 	isRevoked, err := s.tokens.IsRevoked(ctx, refreshToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check token status: %w", err)
 	}
-
 	if isRevoked {
 		return nil, fmt.Errorf("refresh token has been revoked")
 	}
 
-	// 获取Token详情
 	token, err := s.tokens.GetByID(ctx, refreshToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token: %w", err)
 	}
-
-	// 检查Token类型
 	if token.TokenType != "refresh" {
 		return nil, fmt.Errorf("invalid token type")
 	}
-
-	// 检查是否过期
 	if token.ExpiresAt.Before(time.Now()) {
 		return nil, fmt.Errorf("refresh token has expired")
 	}
+	if token.UserID <= 0 {
+		return nil, fmt.Errorf("legacy refresh token; please login again")
+	}
 
-	// 撤销旧的 Token 对
+	user, err := s.users.GetByID(ctx, token.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("get user for refresh: %w", err)
+	}
+	if user.Status != models.UserStatusActive {
+		return nil, models.ErrUserDisabled
+	}
+
+	oldClaims, err := s.parseClaimsUnchecked(refreshToken)
+	if err != nil {
+		return nil, fmt.Errorf("parse refresh token claims: %w", err)
+	}
+	clientID := oldClaims.ClientID
+	if clientID == "" {
+		clientID, _ = generateClientID()
+	}
+
 	if err := s.tokens.Revoke(ctx, refreshToken, "system", "token refreshed"); err != nil {
 		return nil, fmt.Errorf("failed to revoke refresh token: %w", err)
 	}
-	// 清除旧 Token 的缓存
 	s.deleteTokenCache(refreshToken)
 
-	// 生成新的 Access Token (7 天过期)
-	newAccessToken, accessExp, err := s.generateToken(token.ClientInfo, "access", 7*24*time.Hour)
+	newAccessToken, accessExp, err := s.generateToken(user, clientID, accessTokenTTL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate new access token: %w", err)
 	}
-
-	// 生成新的 Refresh Token (30 天过期)
-	newRefreshToken, refreshExp, err := s.generateToken(token.ClientInfo, "refresh", 30*24*time.Hour)
+	newRefreshToken, refreshExp, err := s.generateToken(user, clientID, refreshTokenTTL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate new refresh token: %w", err)
 	}
 
-	// 保存新 Token 到数据库
 	now := time.Now()
-	accessRecord := &models.AuthToken{
-		TokenID:    newAccessToken,
-		TokenType:  "access",
-		ClientInfo: clientInfo,
-		ExpiresAt:  accessExp,
-		CreatedAt:  now,
-	}
-
-	refreshRecord := &models.AuthToken{
-		TokenID:    newRefreshToken,
-		TokenType:  "refresh",
-		ClientInfo: clientInfo,
-		ExpiresAt:  refreshExp,
-		CreatedAt:  now,
-	}
-
-	if err := s.tokens.Create(ctx, accessRecord); err != nil {
-		return nil, fmt.Errorf("failed to save new access token: %w", err)
-	}
-
-	if err := s.tokens.Create(ctx, refreshRecord); err != nil {
-		return nil, fmt.Errorf("failed to save new refresh token: %w", err)
+	if err := s.persistTokenPair(ctx, user.ID, newAccessToken, newRefreshToken, clientInfo, accessExp, refreshExp, now); err != nil {
+		return nil, err
 	}
 
 	return &RefreshResponse{
@@ -345,21 +514,21 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, clientInfo
 		RefreshToken: newRefreshToken,
 		ExpiresIn:    int64(accessExp.Sub(now).Seconds()),
 		TokenType:    "Bearer",
+		UserID:       user.ID,
+		Username:     user.Username,
+		Role:         user.Role,
 	}, nil
 }
 
 // ValidateToken 验证 Token
 func (s *AuthService) ValidateToken(ctx context.Context, tokenString string) (*Claims, error) {
-	// 先尝试从缓存获取
 	if cacheEntry, found := s.getCachedToken(tokenString); found {
 		return cacheEntry.Claims, nil
 	}
 
-	// 缓存未命中，解析 Token 获取 claims
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
 		return s.secret, nil
 	})
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse token: %w", err)
 	}
@@ -369,29 +538,24 @@ func (s *AuthService) ValidateToken(ctx context.Context, tokenString string) (*C
 		return nil, fmt.Errorf("invalid token claims")
 	}
 
-	// 如果是插件系统的 Token，跳过数据库撤销检查
-	// 因为插件 Token 不保存在数据库中
-	if claims.ClientID == "plugin-system" {
-		// 插件 Token 也缓存起来，使用 token 的过期时间
+	// 旧 token 无 role：兼容为 admin；插件 token 视为 admin
+	normalizeClaims(claims)
+
+	if claims.ClientID == pluginClientID {
 		s.setTokenCache(tokenString, claims, claims.ExpiresAt.Time, false)
 		return claims, nil
 	}
 
-	// 对于普通用户 Token，检查是否被撤销
 	isRevoked, err := s.tokens.IsRevoked(ctx, tokenString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check token status: %w", err)
 	}
-
 	if isRevoked {
-		// 缓存撤销状态，使用 token 的过期时间
 		s.setTokenCache(tokenString, claims, claims.ExpiresAt.Time, true)
 		return nil, fmt.Errorf("token has been revoked")
 	}
 
-	// 缓存有效 Token，使用 token 的过期时间
 	s.setTokenCache(tokenString, claims, claims.ExpiresAt.Time, false)
-
 	return claims, nil
 }
 
@@ -400,85 +564,149 @@ func (s *AuthService) ListActiveTokens(ctx context.Context, filter *database.Tok
 	return s.tokens.ListActive(ctx, filter)
 }
 
+// GetToken 按 token_id 取令牌记录。
+func (s *AuthService) GetToken(ctx context.Context, tokenID string) (*models.AuthToken, error) {
+	return s.tokens.GetByID(ctx, tokenID)
+}
+
 // RevokeToken 撤销 Token
 func (s *AuthService) RevokeToken(ctx context.Context, tokenID, revokedBy, reason string) error {
 	err := s.tokens.Revoke(ctx, tokenID, revokedBy, reason)
 	if err == nil {
-		// 清除缓存
 		s.deleteTokenCache(tokenID)
 	}
 	return err
 }
 
-// GeneratePluginToken 生成插件专用的永久 JWT Token
-// 这个 Token 不会过期，专门用于插件内部调用主程序 API
-// 注意：此 Token 不保存到数据库，仅在内存中使用，程序重启后会重新生成
+// GeneratePluginToken 生成插件专用的长期 JWT（视为 admin 权限）。
 func (s *AuthService) GeneratePluginToken(ctx context.Context) (string, error) {
-	clientID := "plugin-system"
-
-	// 生成一个 100 年后过期的 Token（实际上相当于永久）
 	expirationTime := time.Now().Add(100 * 365 * 24 * time.Hour)
-
 	claims := &Claims{
-		ClientID: clientID,
+		ClientID: pluginClientID,
+		Role:     models.UserRoleAdmin,
+		Username: "plugin-system",
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expirationTime),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			ID:        generateRandomString(32), // Token ID
+			ID:        generateRandomString(32),
 		},
 	}
-
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(s.secret)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate plugin token: %w", err)
 	}
-
-	// 注意：插件 Token 不保存到数据库，因为：
-	// 1. 数据库的 token_type 约束只允许 'access' 和 'refresh'
-	// 2. 插件 Token 是内部使用，不需要持久化
-	// 3. 程序重启后会自动重新生成
-	//
-	// 这样做的好处：
-	// - 不需要修改数据库 schema
-	// - 不需要数据库迁移
-	// - Token 验证仍然通过 JWT 签名保证安全性
-
 	return tokenString, nil
 }
 
-// generateToken 生成JWT Token
-func (s *AuthService) generateToken(clientID, tokenType string, expiresIn time.Duration) (string, time.Time, error) {
-	expirationTime := time.Now().Add(expiresIn)
+func (s *AuthService) persistTokenPair(ctx context.Context, userID int64, accessToken, refreshToken, clientInfo string, accessExp, refreshExp, now time.Time) error {
+	accessRecord := &models.AuthToken{
+		TokenID:    accessToken,
+		TokenType:  "access",
+		ClientInfo: clientInfo,
+		UserID:     userID,
+		ExpiresAt:  accessExp,
+		CreatedAt:  now,
+	}
+	refreshRecord := &models.AuthToken{
+		TokenID:    refreshToken,
+		TokenType:  "refresh",
+		ClientInfo: clientInfo,
+		UserID:     userID,
+		ExpiresAt:  refreshExp,
+		CreatedAt:  now,
+	}
+	if err := s.tokens.Create(ctx, accessRecord); err != nil {
+		return fmt.Errorf("failed to save access token: %w", err)
+	}
+	if err := s.tokens.Create(ctx, refreshRecord); err != nil {
+		return fmt.Errorf("failed to save refresh token: %w", err)
+	}
+	return nil
+}
 
+// parseClaimsUnchecked 仅解析 JWT claims（不查撤销表），供登出配对 / refresh 取 client_id。
+func (s *AuthService) parseClaimsUnchecked(tokenString string) (*Claims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		return s.secret, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	claims, ok := token.Claims.(*Claims)
+	if !ok {
+		return nil, fmt.Errorf("invalid token claims")
+	}
+	return claims, nil
+}
+
+func (s *AuthService) generateToken(user *models.User, clientID string, expiresIn time.Duration) (string, time.Time, error) {
+	expirationTime := time.Now().Add(expiresIn)
 	claims := &Claims{
 		ClientID: clientID,
+		UserID:   user.ID,
+		Role:     user.Role,
+		Username: user.Username,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expirationTime),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			ID:        generateRandomString(32), // Token ID
+			ID:        generateRandomString(32),
 		},
 	}
-
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(s.secret)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-
 	return tokenString, expirationTime, nil
 }
 
-// generateClientID 生成客户端ID
+func normalizeClaims(claims *Claims) {
+	if claims.ClientID == pluginClientID {
+		claims.Role = models.UserRoleAdmin
+		return
+	}
+	if claims.Role == "" {
+		// 升级前签发的 token 无 role，兼容为 admin
+		claims.Role = models.UserRoleAdmin
+	}
+}
+
+func hashPassword(password string) (string, error) {
+	b, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		return "", fmt.Errorf("hash password: %w", err)
+	}
+	return string(b), nil
+}
+
+func validateUsername(username string) error {
+	if username == "" {
+		return fmt.Errorf("username is required")
+	}
+	if utf8.RuneCountInString(username) > maxUsernameLen {
+		return fmt.Errorf("username too long")
+	}
+	if strings.ContainsAny(username, " \t\r\n") {
+		return fmt.Errorf("username must not contain whitespace")
+	}
+	return nil
+}
+
+func validatePassword(password string) error {
+	if utf8.RuneCountInString(password) < minPasswordLen {
+		return fmt.Errorf("password must be at least %d characters", minPasswordLen)
+	}
+	return nil
+}
+
 func generateClientID() (string, error) {
 	return generateRandomString(16), nil
 }
 
-// generateRandomString 生成随机字符串
 func generateRandomString(length int) string {
 	bytes := make([]byte, length)
 	if _, err := rand.Read(bytes); err != nil {
-		// fallback to time-based random string
 		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(bytes)[:length]

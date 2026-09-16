@@ -275,12 +275,24 @@ func (a *App) Init() error {
 	// 同理，删标签时清理其 (tag, id) 播放历史
 	a.songTagService.SetPlayHistoryCleaner(db.PlayHistoryRepository())
 
-	// 创建认证服务
-	authService, err := services.NewAuthService(configRepo, db.TokenRepository(), a.config.Username, a.config.Password)
+	// 种子管理员（仅当 users 表尚无 admin 时写入；不覆盖已有密码）
+	if err := services.EnsureAdminUser(context.Background(), db.UserRepository(), a.config.Username, a.config.Password); err != nil {
+		return fmt.Errorf("初始化管理员账号失败: %w", err)
+	}
+
+	// 创建认证服务（凭证一律查库）
+	authService, err := services.NewAuthService(configRepo, db.TokenRepository(), db.UserRepository())
 	if err != nil {
 		return fmt.Errorf("创建认证服务失败: %w", err)
 	}
 	a.authService = authService
+	a.authService.SetOnUserCreated(func(ctx context.Context, userID int64) error {
+		return services.EnsureUserBuiltinPlaylists(ctx, db.PlaylistRepository(), userID)
+	})
+	// 存量 listener：注册钩子之前创建的账号没有个人收藏，启动时幂等补种
+	if err := services.EnsureAllListenerBuiltinPlaylists(context.Background(), db.UserRepository(), db.PlaylistRepository()); err != nil {
+		return fmt.Errorf("补种 listener 收藏歌单失败: %w", err)
+	}
 
 	// 创建升级服务
 	a.upgradeService = services.NewUpgradeService()

@@ -14,6 +14,7 @@ type DB interface {
 
 	JSPluginRepository() *JSPluginRepository
 	TokenRepository() *TokenRepository
+	UserRepository() *UserRepository
 	ConfigRepository() *ConfigRepository
 	SongRepository() *SongRepository
 	PlaylistRepository() *PlaylistRepository

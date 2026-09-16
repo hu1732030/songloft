@@ -13,6 +13,7 @@ import (
 
 	"songloft/internal/database"
 	"songloft/internal/database/testutil"
+	"songloft/internal/middleware"
 	"songloft/internal/models"
 	"songloft/internal/services"
 
@@ -21,18 +22,22 @@ import (
 
 // playlistHandlerEnv 把 :memory: SQLite 下 handler 测试需要的仓储打包好。
 type playlistHandlerEnv struct {
+	db            *database.SQLiteDB
 	playlists     *database.PlaylistRepository
 	playlistSongs *database.PlaylistSongRepository
 	songs         *database.SongRepository
+	users         *database.UserRepository
 }
 
 func newPlaylistHandlerEnv(t *testing.T) *playlistHandlerEnv {
 	t.Helper()
 	mdb := testutil.OpenMemoryDB(t)
 	return &playlistHandlerEnv{
+		db:            mdb,
 		playlists:     mdb.PlaylistRepository(),
 		playlistSongs: mdb.PlaylistSongRepository(),
 		songs:         mdb.SongRepository(),
+		users:         mdb.UserRepository(),
 	}
 }
 
@@ -61,7 +66,9 @@ func newRouteRequest(method, target string, body []byte, params map[string]strin
 	for k, v := range params {
 		rctx.URLParams.Add(k, v)
 	}
-	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, rctx)
+	ctx = middleware.WithAdminContext(ctx)
+	return req.WithContext(ctx)
 }
 
 func TestNewPlaylistHandler(t *testing.T) {
@@ -82,12 +89,68 @@ func TestListPlaylists(t *testing.T) {
 	createTestPlaylist(t, svc, &models.Playlist{Type: models.PlaylistTypeNormal, Name: "歌单2"})
 
 	req := httptest.NewRequest("GET", "/api/v1/playlists", nil)
+	req = req.WithContext(middleware.WithAdminContext(req.Context()))
 	rr := httptest.NewRecorder()
 
 	handler.ListPlaylists(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("handler returned wrong status code: got %v want %v", rr.Code, http.StatusOK)
+	}
+}
+
+func TestListPlaylistsListenerIsolation(t *testing.T) {
+	env := newPlaylistHandlerEnv(t)
+	svc := env.newService()
+	handler := NewPlaylistHandler(svc, nil)
+	ctx := context.Background()
+
+	userA := &models.User{Username: "listener_a", PasswordHash: "x", Role: models.UserRoleListener}
+	userB := &models.User{Username: "listener_b", PasswordHash: "x", Role: models.UserRoleListener}
+	if err := env.users.Create(ctx, userA); err != nil {
+		t.Fatalf("create user A: %v", err)
+	}
+	if err := env.users.Create(ctx, userB); err != nil {
+		t.Fatalf("create user B: %v", err)
+	}
+
+	createTestPlaylist(t, svc, &models.Playlist{Type: models.PlaylistTypeNormal, Name: "A的歌单", OwnerUserID: &userA.ID})
+	b := createTestPlaylist(t, svc, &models.Playlist{Type: models.PlaylistTypeNormal, Name: "B的歌单", OwnerUserID: &userB.ID})
+	createTestPlaylist(t, svc, &models.Playlist{Type: models.PlaylistTypeNormal, Name: "全局歌单"})
+
+	req := httptest.NewRequest("GET", "/api/v1/playlists?exclude_labels=none", nil)
+	req = req.WithContext(middleware.WithAuthContext(req.Context(), userA.ID, models.UserRoleListener, "a", "c"))
+	rr := httptest.NewRecorder()
+	handler.ListPlaylists(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Playlists []*models.Playlist `json:"playlists"`
+		Total     int64              `json:"total"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 1 || len(resp.Playlists) != 1 {
+		t.Fatalf("listener should see only own playlist, total=%d len=%d", resp.Total, len(resp.Playlists))
+	}
+	if resp.Playlists[0].Name != "A的歌单" {
+		t.Errorf("got %q, want A的歌单", resp.Playlists[0].Name)
+	}
+
+	id := strconv.FormatInt(b.ID, 10)
+	getReq := httptest.NewRequest("GET", "/api/v1/playlists/"+id, nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", id)
+	getCtx := context.WithValue(getReq.Context(), chi.RouteCtxKey, rctx)
+	getCtx = middleware.WithAuthContext(getCtx, userA.ID, models.UserRoleListener, "a", "c")
+	getReq = getReq.WithContext(getCtx)
+	getRR := httptest.NewRecorder()
+	handler.GetPlaylist(getRR, getReq)
+	if getRR.Code != http.StatusForbidden {
+		t.Errorf("GetPlaylist other user: status = %d, want 403", getRR.Code)
 	}
 }
 
@@ -138,6 +201,7 @@ func TestCreatePlaylist(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/api/v1/playlists", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(middleware.WithAdminContext(req.Context()))
 	rr := httptest.NewRecorder()
 
 	handler.CreatePlaylist(rr, req)
@@ -153,6 +217,7 @@ func TestCreatePlaylistInvalidJSON(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/api/v1/playlists", bytes.NewReader([]byte("invalid json")))
 	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(middleware.WithAdminContext(req.Context()))
 	rr := httptest.NewRecorder()
 
 	handler.CreatePlaylist(rr, req)
@@ -513,6 +578,7 @@ func TestListPlaylistsWithFilters(t *testing.T) {
 	createTestPlaylist(t, svc, &models.Playlist{Type: models.PlaylistTypeNormal, Name: "歌单2"})
 
 	req := httptest.NewRequest("GET", "/api/v1/playlists?type=normal&limit=10&offset=0", nil)
+	req = req.WithContext(middleware.WithAdminContext(req.Context()))
 	rr := httptest.NewRecorder()
 
 	handler.ListPlaylists(rr, req)

@@ -145,6 +145,11 @@ func (s *SQLiteDB) TokenRepository() *TokenRepository {
 	return NewTokenRepository(s.db)
 }
 
+// UserRepository 返回用户仓储
+func (s *SQLiteDB) UserRepository() *UserRepository {
+	return NewUserRepository(s.db)
+}
+
 // ConfigRepository 返回配置项仓储
 func (s *SQLiteDB) ConfigRepository() *ConfigRepository {
 	return NewConfigRepository(s.db)

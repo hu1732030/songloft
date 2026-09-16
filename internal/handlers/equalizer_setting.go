@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+
+	"songloft/internal/middleware"
 )
 
 const equalizerKey = "equalizer"
@@ -21,33 +23,37 @@ var defaultEqualizerSetting = equalizerSetting{
 	Bands:   []float64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 }
 
-// GetEqualizerSetting 获取均衡器配置
+// GetEqualizerSetting 获取均衡器配置（按用户隔离）
 // @Summary 获取均衡器配置
-// @Description 获取全局均衡器（EQ）配置，包含启用状态、预设名称和 10 段频段增益（31Hz–16kHz，单位 dB，范围 -12 ~ +12）。未配置时返回默认值（关闭 + flat 预设 + 全 0）。
 // @Tags 设置
 // @Produce json
 // @Success 200 {object} equalizerSetting "均衡器配置"
 // @Security BearerAuth
 // @Router /settings/equalizer [get]
 func (h *ConfigHandler) GetEqualizerSetting(w http.ResponseWriter, r *http.Request) {
+	uid := middleware.UserIDFromContext(r.Context())
+	key := userScopedConfigKey(equalizerKey, uid)
 	var cfg equalizerSetting
-	if err := h.configService.GetJSON(equalizerKey, &cfg); err != nil {
+	if err := h.configService.GetJSON(key, &cfg); err != nil {
+		if uid > 0 {
+			if err2 := h.configService.GetJSON(equalizerKey, &cfg); err2 == nil {
+				respondJSON(w, http.StatusOK, cfg)
+				return
+			}
+		}
 		respondJSON(w, http.StatusOK, defaultEqualizerSetting)
 		return
 	}
 	respondJSON(w, http.StatusOK, cfg)
 }
 
-// UpdateEqualizerSetting 保存均衡器配置
+// UpdateEqualizerSetting 保存均衡器配置（按用户隔离）
 // @Summary 保存均衡器配置
-// @Description 保存全局均衡器（EQ）配置。bands 必须包含 10 个元素，每个值在 -12 ~ +12 范围内（单位 dB）。preset 为预设名称（flat/rock/pop/jazz/classical/bass_boost/treble_boost/vocal/custom）。
 // @Tags 设置
 // @Accept json
 // @Produce json
 // @Param request body equalizerSetting true "均衡器配置"
 // @Success 200 {object} equalizerSetting "保存后的均衡器配置"
-// @Failure 400 {object} models.ErrorResponse "请求格式错误"
-// @Failure 500 {object} models.ErrorResponse "保存配置失败"
 // @Security BearerAuth
 // @Router /settings/equalizer [put]
 func (h *ConfigHandler) UpdateEqualizerSetting(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +72,9 @@ func (h *ConfigHandler) UpdateEqualizerSetting(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
-	if err := h.configService.SetJSON(equalizerKey, req); err != nil {
+	uid := middleware.UserIDFromContext(r.Context())
+	key := userScopedConfigKey(equalizerKey, uid)
+	if err := h.configService.SetJSON(key, req); err != nil {
 		respondError(w, http.StatusInternalServerError, "保存配置失败", err)
 		return
 	}

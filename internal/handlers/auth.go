@@ -2,10 +2,12 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
 	"songloft/internal/database"
+	"songloft/internal/middleware"
 	"songloft/internal/models"
 	"songloft/internal/services"
 
@@ -14,14 +16,32 @@ import (
 
 // AuthHandler 认证处理器
 type AuthHandler struct {
-	authService *services.AuthService
+	authService    *services.AuthService
+	captchaService *services.CaptchaService
 }
 
 // NewAuthHandler 创建认证处理器
-func NewAuthHandler(authService *services.AuthService) *AuthHandler {
+func NewAuthHandler(authService *services.AuthService, captchaService *services.CaptchaService) *AuthHandler {
 	return &AuthHandler{
-		authService: authService,
+		authService:    authService,
+		captchaService: captchaService,
 	}
+}
+
+// GetCaptcha 获取图形验证码
+// @Summary 获取图形验证码
+// @Description 返回 captcha_id 与 base64 PNG（data URI），用于注册防刷
+// @Tags 认证管理
+// @Produce json
+// @Success 200 {object} services.CaptchaPayload
+// @Router /auth/captcha [get]
+func (h *AuthHandler) GetCaptcha(w http.ResponseWriter, r *http.Request) {
+	payload, err := h.captchaService.Generate()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "生成验证码失败", err)
+		return
+	}
+	respondJSON(w, http.StatusOK, payload)
 }
 
 // Login 用户登录
@@ -45,20 +65,278 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取客户端信息
 	clientInfo := r.UserAgent()
 	if clientInfo == "" {
 		clientInfo = r.RemoteAddr
 	}
 
-	// 执行登录
 	resp, err := h.authService.Login(ctx, req.Username, req.Password, clientInfo)
 	if err != nil {
+		if errors.Is(err, models.ErrUserDisabled) {
+			respondError(w, http.StatusForbidden, "账号已禁用", err)
+			return
+		}
 		respondError(w, http.StatusUnauthorized, "用户名或密码错误", err)
 		return
 	}
 
 	respondJSON(w, http.StatusOK, resp)
+}
+
+// GuestLogin 游客试听登录
+// @Summary 游客试听
+// @Description 签发 30 分钟临时 access token（无 refresh），仅可试听；需图形验证码，并受 IP 限流保护
+// @Tags 认证管理
+// @Accept json
+// @Produce json
+// @Param request body models.GuestLoginRequest true "验证码"
+// @Success 200 {object} models.LoginResponse "签发成功"
+// @Failure 400 {object} models.ErrorResponse "验证码错误"
+// @Failure 429 {object} models.ErrorResponse "请求过于频繁"
+// @Failure 500 {object} models.ErrorResponse "服务器错误"
+// @Router /auth/guest [post]
+func (h *AuthHandler) GuestLogin(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req models.GuestLoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求数据", err)
+		return
+	}
+
+	if err := h.captchaService.Verify(req.CaptchaID, req.CaptchaCode); err != nil {
+		respondError(w, http.StatusBadRequest, "验证码错误或已过期", err)
+		return
+	}
+
+	clientInfo := r.UserAgent()
+	if clientInfo == "" {
+		clientInfo = r.RemoteAddr
+	}
+
+	resp, err := h.authService.GuestLogin(ctx, clientInfo)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "游客登录失败", err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, resp)
+}
+
+// Register 注册 listener 用户
+// @Summary 用户注册
+// @Description 注册普通听歌用户（listener），成功后返回登录令牌
+// @Tags 认证管理
+// @Accept json
+// @Produce json
+// @Param request body models.RegisterRequest true "注册请求"
+// @Success 201 {object} models.LoginResponse "注册并登录成功"
+// @Failure 400 {object} models.ErrorResponse "请求数据错误"
+// @Failure 409 {object} models.ErrorResponse "用户名已存在"
+// @Router /auth/register [post]
+func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req models.RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求数据", err)
+		return
+	}
+
+	if err := h.captchaService.Verify(req.CaptchaID, req.CaptchaCode); err != nil {
+		respondError(w, http.StatusBadRequest, "验证码错误或已过期", err)
+		return
+	}
+
+	clientInfo := r.UserAgent()
+	if clientInfo == "" {
+		clientInfo = r.RemoteAddr
+	}
+
+	resp, err := h.authService.Register(ctx, req.Username, req.Password, clientInfo)
+	if err != nil {
+		if errors.Is(err, models.ErrUsernameConflict) {
+			respondError(w, http.StatusConflict, "用户名已存在", err)
+			return
+		}
+		respondError(w, http.StatusBadRequest, "注册失败", err)
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, resp)
+}
+
+// ChangePassword 修改当前用户密码
+// @Summary 修改密码
+// @Description 修改当前登录用户的密码
+// @Tags 认证管理
+// @Accept json
+// @Produce json
+// @Param request body models.ChangePasswordRequest true "改密请求"
+// @Success 200 {object} models.SuccessResponse "修改成功"
+// @Failure 400 {object} models.ErrorResponse "请求数据错误"
+// @Failure 401 {object} models.ErrorResponse "旧密码错误"
+// @Security BearerAuth
+// @Router /auth/password [put]
+func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID := middleware.UserIDFromContext(ctx)
+	if userID <= 0 {
+		respondError(w, http.StatusUnauthorized, "未授权", nil)
+		return
+	}
+
+	var req models.ChangePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求数据", err)
+		return
+	}
+
+	if err := h.authService.ChangePassword(ctx, userID, req.OldPassword, req.NewPassword); err != nil {
+		if errors.Is(err, models.ErrInvalidCredentials) {
+			respondError(w, http.StatusUnauthorized, "旧密码错误", err)
+			return
+		}
+		respondError(w, http.StatusBadRequest, "修改密码失败", err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, models.SuccessResponse{Message: "密码已更新"})
+}
+
+// ListUsers 管理员分页列出用户
+// @Summary 用户列表
+// @Description 管理员分页查询用户（不含密码哈希）
+// @Tags 用户管理
+// @Produce json
+// @Param limit query int false "每页数量" default(20)
+// @Param offset query int false "偏移量" default(0)
+// @Param role query string false "角色" Enums(admin, listener)
+// @Param status query string false "状态" Enums(active, disabled)
+// @Param q query string false "用户名关键词"
+// @Success 200 {object} map[string]interface{} "用户列表"
+// @Security BearerAuth
+// @Router /users [get]
+func (h *AuthHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	limit := models.DefaultPaginationLimit
+	offset := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			offset = n
+		}
+	}
+
+	filter := &database.UserFilter{
+		Role:    r.URL.Query().Get("role"),
+		Status:  r.URL.Query().Get("status"),
+		Keyword: r.URL.Query().Get("q"),
+		Limit:   limit,
+		Offset:  offset,
+		OrderBy: "id",
+		Order:   "ASC",
+	}
+
+	users, total, err := h.authService.ListUsers(ctx, filter)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取用户列表失败", err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"users":  users,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// AdminResetPassword 管理员重置指定用户密码
+// @Summary 重置用户密码
+// @Description 管理员为指定用户设置新密码，并撤销其全部活跃令牌
+// @Tags 用户管理
+// @Accept json
+// @Produce json
+// @Param id path int true "用户 ID"
+// @Param request body models.AdminResetPasswordRequest true "新密码"
+// @Success 200 {object} models.SuccessResponse "重置成功"
+// @Failure 400 {object} models.ErrorResponse "请求数据错误"
+// @Failure 404 {object} models.ErrorResponse "用户不存在"
+// @Security BearerAuth
+// @Router /users/{id}/password [put]
+func (h *AuthHandler) AdminResetPassword(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		respondError(w, http.StatusBadRequest, "无效的用户 ID", err)
+		return
+	}
+
+	var req models.AdminResetPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求数据", err)
+		return
+	}
+
+	if err := h.authService.AdminResetPassword(ctx, id, req.Password); err != nil {
+		if errors.Is(err, database.ErrNotFound) {
+			respondError(w, http.StatusNotFound, "用户不存在", err)
+			return
+		}
+		respondError(w, http.StatusBadRequest, "重置密码失败", err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, models.SuccessResponse{Message: "密码已重置"})
+}
+
+// AdminSetUserStatus 管理员启用/禁用用户（禁止禁用 admin）
+// @Summary 更新用户状态
+// @Description 启用或禁用指定用户；管理员账号不可禁用
+// @Tags 用户管理
+// @Accept json
+// @Produce json
+// @Param id path int true "用户 ID"
+// @Param request body models.UpdateUserStatusRequest true "状态"
+// @Success 200 {object} models.SuccessResponse "更新成功"
+// @Failure 400 {object} models.ErrorResponse "请求错误或禁止禁用管理员"
+// @Failure 404 {object} models.ErrorResponse "用户不存在"
+// @Security BearerAuth
+// @Router /users/{id}/status [patch]
+func (h *AuthHandler) AdminSetUserStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		respondError(w, http.StatusBadRequest, "无效的用户 ID", err)
+		return
+	}
+
+	var req models.UpdateUserStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求数据", err)
+		return
+	}
+
+	if err := h.authService.AdminSetUserStatus(ctx, id, req.Status); err != nil {
+		if errors.Is(err, models.ErrCannotDisableAdmin) {
+			respondError(w, http.StatusBadRequest, "不能禁用管理员账号", err)
+			return
+		}
+		if errors.Is(err, database.ErrNotFound) {
+			respondError(w, http.StatusNotFound, "用户不存在", err)
+			return
+		}
+		respondError(w, http.StatusBadRequest, "更新用户状态失败", err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, models.SuccessResponse{Message: "用户状态已更新"})
 }
 
 // Logout 用户登出
@@ -74,17 +352,11 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 // @Router /auth/logout [post]
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	clientID := middleware.ClientIDFromContext(ctx)
 
-	// 从请求上下文中获取当前用户信息
-	// 这里假设中间件已经设置了用户信息
-	clientID := r.Header.Get("X-Client-ID") // 这将在中间件中设置
-
-	// 获取当前访问令牌
 	authHeader := r.Header.Get("Authorization")
 	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
 		accessToken := authHeader[7:]
-
-		// 执行登出
 		if err := h.authService.Logout(ctx, accessToken, clientID); err != nil {
 			respondError(w, http.StatusInternalServerError, "登出失败", err)
 			return
@@ -117,13 +389,11 @@ func (h *AuthHandler) RefreshToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取客户端信息
 	clientInfo := r.UserAgent()
 	if clientInfo == "" {
 		clientInfo = r.RemoteAddr
 	}
 
-	// 执行刷新令牌
 	resp, err := h.authService.RefreshToken(ctx, req.RefreshToken, clientInfo)
 	if err != nil {
 		respondError(w, http.StatusUnauthorized, "刷新令牌无效", err)
@@ -150,7 +420,6 @@ func (h *AuthHandler) RefreshToken(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) ListTokens(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// 解析查询参数
 	tokenType := r.URL.Query().Get("type")
 	limitStr := r.URL.Query().Get("limit")
 	offsetStr := r.URL.Query().Get("offset")
@@ -170,7 +439,6 @@ func (h *AuthHandler) ListTokens(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 构建过滤条件
 	filter := &database.TokenFilter{
 		TokenType: tokenType,
 		Limit:     limit,
@@ -178,8 +446,16 @@ func (h *AuthHandler) ListTokens(w http.ResponseWriter, r *http.Request) {
 		OrderBy:   "created_at",
 		Order:     "DESC",
 	}
+	// listener 只能看自己的；admin 可看全站（不设 UserID）
+	if !middleware.IsAdmin(ctx) {
+		uid := middleware.UserIDFromContext(ctx)
+		if uid <= 0 {
+			respondError(w, http.StatusUnauthorized, "未授权", nil)
+			return
+		}
+		filter.UserID = uid
+	}
 
-	// 获取令牌列表
 	tokens, err := h.authService.ListActiveTokens(ctx, filter)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "获取令牌列表失败", err)
@@ -218,13 +494,25 @@ func (h *AuthHandler) RevokeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取客户端信息作为撤销者
-	revokedBy := r.Header.Get("X-Client-ID")
+	// listener 只能撤销自己的令牌
+	if !middleware.IsAdmin(ctx) {
+		uid := middleware.UserIDFromContext(ctx)
+		tok, err := h.authService.GetToken(ctx, tokenID)
+		if err != nil {
+			respondError(w, http.StatusNotFound, "令牌不存在", err)
+			return
+		}
+		if tok.UserID != uid {
+			respondError(w, http.StatusForbidden, "无权撤销该令牌", nil)
+			return
+		}
+	}
+
+	revokedBy := middleware.ClientIDFromContext(ctx)
 	if revokedBy == "" {
 		revokedBy = "unknown"
 	}
 
-	// 执行撤销令牌
 	if err := h.authService.RevokeToken(ctx, tokenID, revokedBy, req.Reason); err != nil {
 		respondError(w, http.StatusInternalServerError, "撤销令牌失败", err)
 		return
@@ -248,6 +536,5 @@ func (h *AuthHandler) RevokeToken(w http.ResponseWriter, r *http.Request) {
 // @Security BearerAuth
 // @Router /auth/tokens/{token_id} [get]
 func (h *AuthHandler) GetTokenInfo(w http.ResponseWriter, r *http.Request) {
-	// 这个接口将在后续实现中添加
 	respondError(w, http.StatusNotImplemented, "功能未实现", nil)
 }

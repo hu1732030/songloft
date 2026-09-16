@@ -52,6 +52,21 @@ var (
 
 	// ErrBuiltInPlaylist 表示对内置歌单执行了不允许的操作
 	ErrBuiltInPlaylist = errors.New("cannot modify built-in playlist")
+
+	// ErrUsernameConflict 表示用户名已被占用
+	ErrUsernameConflict = errors.New("username already exists")
+
+	// ErrUserDisabled 表示账号已被禁用
+	ErrUserDisabled = errors.New("user account is disabled")
+
+	// ErrPlaylistForbidden 表示无权访问该歌单（非所有者 / 全局歌单对 listener）
+	ErrPlaylistForbidden = errors.New("playlist access forbidden")
+
+	// ErrCaptchaInvalid 表示图形验证码错误或已过期
+	ErrCaptchaInvalid = errors.New("invalid or expired captcha")
+
+	// ErrCannotDisableAdmin 表示禁止禁用管理员账号
+	ErrCannotDisableAdmin = errors.New("cannot disable admin user")
 )
 
 // 认证相关常量
@@ -336,6 +351,7 @@ type Playlist struct {
 	SongCount   int        `json:"song_count" example:"10"`                              // 歌曲数量
 	RemoteCount int        `json:"remote_count" example:"3"`                             // 歌单内网络歌曲（songs.type=remote）数量，>0 即为「网络歌单」；仅列表接口填充，详情接口恒为 0
 	PinnedAt    *time.Time `json:"pinned_at,omitempty" example:"2024-01-01T12:00:00Z"`   // 置顶时间，nil 表示未置顶；多个置顶歌单按此字段倒序排列
+	OwnerUserID *int64     `json:"owner_user_id,omitempty" example:"2"`                  // 归属用户；nil 表示系统/全局歌单（仅 admin 可写）
 	CreatedAt   time.Time  `json:"created_at" example:"2024-01-01T12:00:00Z"`            // 创建时间
 	UpdatedAt   time.Time  `json:"updated_at" example:"2024-01-01T12:00:00Z"`            // 最后更新时间
 }
@@ -555,12 +571,33 @@ type TokenInfo struct {
 	RevokedReason string    `json:"revoked_reason,omitempty" example:"用户主动登出"`              // 撤销原因
 }
 
+// 用户角色与状态
+const (
+	UserRoleAdmin    = "admin"
+	UserRoleListener = "listener"
+	UserRoleGuest    = "guest"
+	UserStatusActive   = "active"
+	UserStatusDisabled = "disabled"
+)
+
+// User 系统用户
+type User struct {
+	ID           int64     `json:"id" example:"1"`
+	Username     string    `json:"username" example:"alice"`
+	PasswordHash string    `json:"-"`
+	Role         string    `json:"role" example:"listener" enums:"admin,listener"`
+	Status       string    `json:"status" example:"active" enums:"active,disabled"`
+	CreatedAt    time.Time `json:"created_at" example:"2024-01-01T12:00:00Z"`
+	UpdatedAt    time.Time `json:"updated_at" example:"2024-01-01T12:00:00Z"`
+}
+
 // AuthToken 认证令牌结构体
 type AuthToken struct {
 	ID            int64     `json:"id" example:"1"`                                         // 记录 ID
 	TokenID       string    `json:"token_id" example:"abc123"`                              // 令牌 ID
 	TokenType     string    `json:"token_type" example:"access" enums:"access,refresh"`     // 令牌类型
 	ClientInfo    string    `json:"client_info" example:"Mozilla/5.0 AppleWebKit/605.1.15"` // 客户端信息
+	UserID        int64     `json:"user_id,omitempty" example:"1"`                          // 关联用户 ID
 	ExpiresAt     time.Time `json:"expires_at" example:"2024-01-08T12:00:00Z"`              // 过期时间
 	RevokedAt     time.Time `json:"revoked_at,omitempty" example:"2024-01-01T12:00:00Z"`    // 撤销时间
 	RevokedBy     string    `json:"revoked_by,omitempty" example:"user"`                    // 撤销者
@@ -587,8 +624,41 @@ type LoginRequest struct {
 type LoginResponse struct {
 	AccessToken  string `json:"access_token" example:"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."`  // Access Token
 	RefreshToken string `json:"refresh_token" example:"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."` // Refresh Token
-	ExpiresIn    int64  `json:"expires_in" example:"604800"`                                     // Access Token 过期时间（秒）
+	ExpiresIn    int64  `json:"expires_in" example:"2592000"`                                    // Access Token 过期时间（秒）
 	TokenType    string `json:"token_type" example:"Bearer"`                                     // Token 类型
+	UserID       int64  `json:"user_id" example:"1"`                                             // 用户 ID
+	Username     string `json:"username" example:"admin"`                                        // 用户名
+	Role         string `json:"role" example:"admin" enums:"admin,listener"`                     // 角色
+}
+
+// RegisterRequest 注册请求（仅创建 listener）
+type RegisterRequest struct {
+	Username    string `json:"username" example:"alice" binding:"required"`
+	Password    string `json:"password" example:"secret123" binding:"required"`
+	CaptchaID   string `json:"captcha_id" example:"a1b2c3d4" binding:"required"`
+	CaptchaCode string `json:"captcha_code" example:"AB12" binding:"required"`
+}
+
+// GuestLoginRequest 游客试听请求（需图形验证码）
+type GuestLoginRequest struct {
+	CaptchaID   string `json:"captcha_id" example:"a1b2c3d4" binding:"required"`
+	CaptchaCode string `json:"captcha_code" example:"AB12" binding:"required"`
+}
+
+// ChangePasswordRequest 修改当前用户密码
+type ChangePasswordRequest struct {
+	OldPassword string `json:"old_password" example:"oldpass" binding:"required"`
+	NewPassword string `json:"new_password" example:"newpass" binding:"required"`
+}
+
+// AdminResetPasswordRequest 管理员重置指定用户密码
+type AdminResetPasswordRequest struct {
+	Password string `json:"password" example:"newpass" binding:"required"`
+}
+
+// UpdateUserStatusRequest 管理员更新用户状态
+type UpdateUserStatusRequest struct {
+	Status string `json:"status" example:"disabled" enums:"active,disabled" binding:"required"`
 }
 
 // AutoCreatePlaylistsRequest 自动创建歌单请求结构体

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"slices"
 
+	"songloft/internal/middleware"
 	"songloft/internal/models"
 )
 
@@ -62,8 +63,16 @@ func isValidLibraryViewKey(key string) bool {
 // @Security BearerAuth
 // @Router /settings/library-browse [get]
 func (h *ConfigHandler) GetLibraryBrowseSetting(w http.ResponseWriter, r *http.Request) {
+	uid := middleware.UserIDFromContext(r.Context())
+	key := userScopedConfigKey(libraryBrowseKey, uid)
 	var cfg libraryBrowseSetting
-	if err := h.configService.GetJSON(libraryBrowseKey, &cfg); err != nil {
+	if err := h.configService.GetJSON(key, &cfg); err != nil {
+		if uid > 0 {
+			if err2 := h.configService.GetJSON(libraryBrowseKey, &cfg); err2 == nil {
+				respondJSON(w, http.StatusOK, normalizeLibraryBrowse(cfg))
+				return
+			}
+		}
 		respondJSON(w, http.StatusOK, defaultLibraryBrowse)
 		return
 	}
@@ -103,7 +112,9 @@ func (h *ConfigHandler) UpdateLibraryBrowseSetting(w http.ResponseWriter, r *htt
 	}
 
 	normalized := normalizeLibraryBrowse(req)
-	if err := h.configService.SetJSON(libraryBrowseKey, normalized); err != nil {
+	uid := middleware.UserIDFromContext(r.Context())
+	key := userScopedConfigKey(libraryBrowseKey, uid)
+	if err := h.configService.SetJSON(key, normalized); err != nil {
 		respondError(w, http.StatusInternalServerError, "保存配置失败", err)
 		return
 	}

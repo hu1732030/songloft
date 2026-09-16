@@ -44,14 +44,14 @@ func TestPlayHistoryRecordDedup(t *testing.T) {
 	first := time.Now().Add(-time.Hour).Truncate(time.Second)
 	later := time.Now().Truncate(time.Second)
 
-	if err := repo.Record(ctx, "playlist", "1", ids[0], first); err != nil {
+	if err := repo.Record(ctx, 1, "playlist", "1", ids[0], first); err != nil {
 		t.Fatalf("first record: %v", err)
 	}
-	if err := repo.Record(ctx, "playlist", "1", ids[0], later); err != nil {
+	if err := repo.Record(ctx, 1, "playlist", "1", ids[0], later); err != nil {
 		t.Fatalf("second record: %v", err)
 	}
 
-	rows, err := repo.List(ctx, "playlist", "1", 50)
+	rows, err := repo.List(ctx, 1, "playlist", "1", 50)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -78,16 +78,16 @@ func TestPlayHistoryTrim(t *testing.T) {
 	// 每首歌间隔 1 分钟，ids[0] 最旧、ids[total-1] 最新。
 	base := time.Now().Add(-time.Duration(total) * time.Minute).Truncate(time.Second)
 	for i, id := range ids {
-		if err := repo.Record(ctx, "artist", "周杰伦", id, base.Add(time.Duration(i)*time.Minute)); err != nil {
+		if err := repo.Record(ctx, 1, "artist", "周杰伦", id, base.Add(time.Duration(i)*time.Minute)); err != nil {
 			t.Fatalf("record %d: %v", i, err)
 		}
 	}
 
-	if err := repo.Trim(ctx, "artist", "周杰伦", keep); err != nil {
+	if err := repo.Trim(ctx, 1, "artist", "周杰伦", keep); err != nil {
 		t.Fatalf("Trim: %v", err)
 	}
 
-	count, err := repo.Count(ctx, "artist", "周杰伦")
+	count, err := repo.Count(ctx, 1, "artist", "周杰伦")
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestPlayHistoryTrim(t *testing.T) {
 	}
 
 	// 被裁掉的必须是最旧那条，最新那条必须在列表首位。
-	rows, err := repo.List(ctx, "artist", "周杰伦", keep)
+	rows, err := repo.List(ctx, 1, "artist", "周杰伦", keep)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -120,14 +120,14 @@ func TestPlayHistoryTrimNonPositiveIsNoop(t *testing.T) {
 	ctx := context.Background()
 
 	for _, id := range ids {
-		if err := repo.Record(ctx, "album", "范特西", id, time.Now()); err != nil {
+		if err := repo.Record(ctx, 1, "album", "范特西", id, time.Now()); err != nil {
 			t.Fatalf("record: %v", err)
 		}
 	}
-	if err := repo.Trim(ctx, "album", "范特西", 0); err != nil {
+	if err := repo.Trim(ctx, 1, "album", "范特西", 0); err != nil {
 		t.Fatalf("Trim: %v", err)
 	}
-	count, err := repo.Count(ctx, "album", "范特西")
+	count, err := repo.Count(ctx, 1, "album", "范特西")
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestPlayHistoryContextIsolation(t *testing.T) {
 		{"artist", "1", ids[1]},
 		{"playlist", "2", ids[2]},
 	} {
-		rows, err := repo.List(ctx, tc.ctxType, tc.ctxKey, 50)
+		rows, err := repo.List(ctx, 1, tc.ctxType, tc.ctxKey, 50)
 		if err != nil {
 			t.Fatalf("List(%s,%s): %v", tc.ctxType, tc.ctxKey, err)
 		}
@@ -187,7 +187,7 @@ func TestPlayHistoryListOrdering(t *testing.T) {
 	mustRecord(t, repo, "genre", "Pop", ids[0], base.Add(time.Minute))
 	mustRecord(t, repo, "genre", "Pop", ids[1], base.Add(2*time.Minute))
 
-	rows, err := repo.List(ctx, "genre", "Pop", 50)
+	rows, err := repo.List(ctx, 1, "genre", "Pop", 50)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestPlayHistoryListLimit(t *testing.T) {
 		mustRecord(t, repo, "style", "R&B", id, time.Now().Add(time.Duration(i)*time.Minute))
 	}
 
-	rows, err := repo.List(ctx, "style", "R&B", 2)
+	rows, err := repo.List(ctx, 1, "style", "R&B", 2)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestPlayHistoryListLimit(t *testing.T) {
 		t.Errorf("expected 2 rows with limit=2, got %d", len(rows))
 	}
 
-	empty, err := repo.List(ctx, "style", "R&B", 0)
+	empty, err := repo.List(ctx, 1, "style", "R&B", 0)
 	if err != nil {
 		t.Fatalf("List with limit 0: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestPlayHistoryCascadeOnSongDelete(t *testing.T) {
 		t.Fatalf("Delete song: %v", err)
 	}
 
-	rows, err := repo.List(ctx, "playlist", "1", 50)
+	rows, err := repo.List(ctx, 1, "playlist", "1", 50)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -265,21 +265,21 @@ func TestPlayHistoryClearAndDeleteEntry(t *testing.T) {
 		mustRecord(t, repo, "playlist", "7", id, time.Now())
 	}
 
-	if err := repo.DeleteEntry(ctx, "playlist", "7", ids[0]); err != nil {
+	if err := repo.DeleteEntry(ctx, 1, "playlist", "7", ids[0]); err != nil {
 		t.Fatalf("DeleteEntry: %v", err)
 	}
-	if err := repo.DeleteEntry(ctx, "playlist", "7", ids[0]); !errors.Is(err, ErrNotFound) {
+	if err := repo.DeleteEntry(ctx, 1, "playlist", "7", ids[0]); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound on second delete, got %v", err)
 	}
 
-	deleted, err := repo.Clear(ctx, "playlist", "7")
+	deleted, err := repo.Clear(ctx, 1, "playlist", "7")
 	if err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
 	if deleted != 2 {
 		t.Errorf("expected 2 rows cleared, got %d", deleted)
 	}
-	count, err := repo.Count(ctx, "playlist", "7")
+	count, err := repo.Count(ctx, 1, "playlist", "7")
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestPlayHistoryClearByPlaylist(t *testing.T) {
 		{"playlist", "10"},
 		{"artist", "9"},
 	} {
-		count, err := repo.Count(ctx, tc.ctxType, tc.ctxKey)
+		count, err := repo.Count(ctx, 1, tc.ctxType, tc.ctxKey)
 		if err != nil {
 			t.Fatalf("Count(%s,%s): %v", tc.ctxType, tc.ctxKey, err)
 		}
@@ -346,7 +346,7 @@ func TestPlayHistoryClearByTag(t *testing.T) {
 		{"tag", "10"},
 		{"playlist", "9"},
 	} {
-		count, err := repo.Count(ctx, tc.ctxType, tc.ctxKey)
+		count, err := repo.Count(ctx, 1, tc.ctxType, tc.ctxKey)
 		if err != nil {
 			t.Fatalf("Count(%s,%s): %v", tc.ctxType, tc.ctxKey, err)
 		}
@@ -445,7 +445,7 @@ func TestSongListByIDs(t *testing.T) {
 
 func mustRecord(t *testing.T, repo *PlayHistoryRepository, ctxType, ctxKey string, songID int64, at time.Time) {
 	t.Helper()
-	if err := repo.Record(context.Background(), ctxType, ctxKey, songID, at); err != nil {
+	if err := repo.Record(context.Background(), 1, ctxType, ctxKey, songID, at); err != nil {
 		t.Fatalf("Record(%s,%s,%d): %v", ctxType, ctxKey, songID, err)
 	}
 }

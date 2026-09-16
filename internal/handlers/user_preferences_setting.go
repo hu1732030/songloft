@@ -3,6 +3,8 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+
+	"songloft/internal/middleware"
 )
 
 const userPreferencesKey = "user_preferences"
@@ -35,8 +37,17 @@ var defaultUserPreferences = userPreferencesSetting{
 // @Security BearerAuth
 // @Router /settings/user-preferences [get]
 func (h *ConfigHandler) GetUserPreferencesSetting(w http.ResponseWriter, r *http.Request) {
+	uid := middleware.UserIDFromContext(r.Context())
+	key := userScopedConfigKey(userPreferencesKey, uid)
 	var cfg userPreferencesSetting
-	if err := h.configService.GetJSON(userPreferencesKey, &cfg); err != nil {
+	if err := h.configService.GetJSON(key, &cfg); err != nil {
+		// 兼容升级前全局 key
+		if uid > 0 {
+			if err2 := h.configService.GetJSON(userPreferencesKey, &cfg); err2 == nil {
+				respondJSON(w, http.StatusOK, cfg)
+				return
+			}
+		}
 		respondJSON(w, http.StatusOK, defaultUserPreferences)
 		return
 	}
@@ -61,7 +72,9 @@ func (h *ConfigHandler) UpdateUserPreferencesSetting(w http.ResponseWriter, r *h
 		respondError(w, http.StatusBadRequest, "请求格式错误", err)
 		return
 	}
-	if err := h.configService.SetJSON(userPreferencesKey, req); err != nil {
+	uid := middleware.UserIDFromContext(r.Context())
+	key := userScopedConfigKey(userPreferencesKey, uid)
+	if err := h.configService.SetJSON(key, req); err != nil {
 		respondError(w, http.StatusInternalServerError, "保存配置失败", err)
 		return
 	}

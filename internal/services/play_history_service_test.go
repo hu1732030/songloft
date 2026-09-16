@@ -37,12 +37,12 @@ func TestPlayHistoryServiceRecordTrimsInTx(t *testing.T) {
 
 	base := time.Now().Add(-time.Hour)
 	for i, song := range songs {
-		if err := svc.Record(ctx, models.PlayContextPlaylist, "1", song.ID, base.Add(time.Duration(i)*time.Minute)); err != nil {
+		if err := svc.Record(ctx, 1, models.PlayContextPlaylist, "1", song.ID, base.Add(time.Duration(i)*time.Minute)); err != nil {
 			t.Fatalf("Record %d: %v", i, err)
 		}
 	}
 
-	entries, err := svc.List(ctx, models.PlayContextPlaylist, "1", MaxPlayHistoryPerContext)
+	entries, err := svc.List(ctx, 1, models.PlayContextPlaylist, "1", MaxPlayHistoryPerContext)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -65,12 +65,12 @@ func TestPlayHistoryServiceListHydratesSongs(t *testing.T) {
 
 	// 乱序写入：songs[1] 最新，songs[2] 次新，songs[0] 最旧
 	for i, idx := range []int{0, 2, 1} {
-		if err := svc.Record(ctx, "artist", "周杰伦", songs[idx].ID, base.Add(time.Duration(i)*time.Minute)); err != nil {
+		if err := svc.Record(ctx, 1, "artist", "周杰伦", songs[idx].ID, base.Add(time.Duration(i)*time.Minute)); err != nil {
 			t.Fatalf("Record: %v", err)
 		}
 	}
 
-	entries, err := svc.List(ctx, "artist", "周杰伦", 50)
+	entries, err := svc.List(ctx, 1, "artist", "周杰伦", 50)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -102,22 +102,22 @@ func TestPlayHistoryServiceRejectsInvalidContext(t *testing.T) {
 	songs := seedPlayHistorySongs(t, svc, 1)
 
 	for _, badType := range []string{"", "folder", "PLAYLIST", "keyword"} {
-		err := svc.Record(ctx, badType, "1", songs[0].ID, time.Now())
+		err := svc.Record(ctx, 1, badType, "1", songs[0].ID, time.Now())
 		if !errors.Is(err, ErrInvalidPlayContext) {
 			t.Errorf("Record(type=%q): expected ErrInvalidPlayContext, got %v", badType, err)
 		}
-		if _, err := svc.List(ctx, badType, "1", 50); !errors.Is(err, ErrInvalidPlayContext) {
+		if _, err := svc.List(ctx, 1, badType, "1", 50); !errors.Is(err, ErrInvalidPlayContext) {
 			t.Errorf("List(type=%q): expected ErrInvalidPlayContext, got %v", badType, err)
 		}
-		if _, err := svc.Clear(ctx, badType, "1"); !errors.Is(err, ErrInvalidPlayContext) {
+		if _, err := svc.Clear(ctx, 1, badType, "1"); !errors.Is(err, ErrInvalidPlayContext) {
 			t.Errorf("Clear(type=%q): expected ErrInvalidPlayContext, got %v", badType, err)
 		}
-		if err := svc.DeleteEntry(ctx, badType, "1", songs[0].ID); !errors.Is(err, ErrInvalidPlayContext) {
+		if err := svc.DeleteEntry(ctx, 1, badType, "1", songs[0].ID); !errors.Is(err, ErrInvalidPlayContext) {
 			t.Errorf("DeleteEntry(type=%q): expected ErrInvalidPlayContext, got %v", badType, err)
 		}
 	}
 
-	if err := svc.Record(ctx, models.PlayContextPlaylist, "", songs[0].ID, time.Now()); !errors.Is(err, ErrInvalidPlayContext) {
+	if err := svc.Record(ctx, 1, models.PlayContextPlaylist, "", songs[0].ID, time.Now()); !errors.Is(err, ErrInvalidPlayContext) {
 		t.Errorf("Record(empty key): expected ErrInvalidPlayContext, got %v", err)
 	}
 }
@@ -164,14 +164,14 @@ func TestPlaylistDeleteClearsPlayHistory(t *testing.T) {
 	const builtInID int64 = 1
 
 	for _, key := range []string{fmt.Sprint(soloID), fmt.Sprint(batchID), fmt.Sprint(builtInID)} {
-		if err := histSvc.Record(ctx, models.PlayContextPlaylist, key, songID, time.Now()); err != nil {
+		if err := histSvc.Record(ctx, 1, models.PlayContextPlaylist, key, songID, time.Now()); err != nil {
 			t.Fatalf("Record for playlist %s: %v", key, err)
 		}
 	}
 
 	historyCount := func(playlistID int64) int {
 		t.Helper()
-		n, err := mdb.PlayHistoryRepository().Count(ctx, models.PlayContextPlaylist, fmt.Sprint(playlistID))
+		n, err := mdb.PlayHistoryRepository().Count(ctx, 1, models.PlayContextPlaylist, fmt.Sprint(playlistID))
 		if err != nil {
 			t.Fatalf("Count for playlist %d: %v", playlistID, err)
 		}
@@ -222,14 +222,14 @@ func TestSongTagDeleteClearsPlayHistory(t *testing.T) {
 	otherID := makeTag("保留测试")
 
 	for _, key := range []string{fmt.Sprint(soloID), fmt.Sprint(otherID)} {
-		if err := histSvc.Record(ctx, models.PlayContextTag, key, songID, time.Now()); err != nil {
+		if err := histSvc.Record(ctx, 1, models.PlayContextTag, key, songID, time.Now()); err != nil {
 			t.Fatalf("Record for tag %s: %v", key, err)
 		}
 	}
 
 	historyCount := func(tagID int64) int {
 		t.Helper()
-		n, err := mdb.PlayHistoryRepository().Count(ctx, models.PlayContextTag, fmt.Sprint(tagID))
+		n, err := mdb.PlayHistoryRepository().Count(ctx, 1, models.PlayContextTag, fmt.Sprint(tagID))
 		if err != nil {
 			t.Fatalf("Count for tag %d: %v", tagID, err)
 		}
@@ -251,7 +251,7 @@ func TestSongTagDeleteClearsPlayHistory(t *testing.T) {
 // handler 直接序列化即可得到 [] 而不是 null。
 func TestPlayHistoryServiceEmptyContextReturnsEmptySlice(t *testing.T) {
 	svc := NewPlayHistoryService(testutil.OpenMemoryDB(t))
-	entries, err := svc.List(context.Background(), "album", "不存在的专辑", 50)
+	entries, err := svc.List(context.Background(), 1, "album", "不存在的专辑", 50)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}

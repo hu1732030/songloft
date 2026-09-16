@@ -6,7 +6,17 @@ import (
 	"net/http"
 	"strings"
 
+	"songloft/internal/models"
 	"songloft/internal/services"
+)
+
+type contextKey string
+
+const (
+	ctxClientID contextKey = "client_id"
+	ctxUserID   contextKey = "user_id"
+	ctxRole     contextKey = "role"
+	ctxUsername contextKey = "username"
 )
 
 func respondAuthError(w http.ResponseWriter, status int, message string, err error) {
@@ -24,11 +34,52 @@ type PublicPathChecker interface {
 	IsPublicPath(path string) bool
 }
 
+// ClientIDFromContext 从上下文取 client_id。
+func ClientIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxClientID).(string); ok {
+		return v
+	}
+	// 兼容旧测试/代码用字符串 key
+	if v, ok := ctx.Value("client_id").(string); ok {
+		return v
+	}
+	return ""
+}
+
+// UserIDFromContext 从上下文取 user_id。
+func UserIDFromContext(ctx context.Context) int64 {
+	if v, ok := ctx.Value(ctxUserID).(int64); ok {
+		return v
+	}
+	return 0
+}
+
+// RoleFromContext 从上下文取 role。
+func RoleFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxRole).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// UsernameFromContext 从上下文取 username。
+func UsernameFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxUsername).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// IsAdmin 判断当前请求是否具备管理员权限（含插件 token）。
+// 未写入 role 时返回 false（fail-closed）；单测请用 WithAdminContext 注入。
+func IsAdmin(ctx context.Context) bool {
+	return RoleFromContext(ctx) == models.UserRoleAdmin
+}
+
 // AuthMiddleware 认证中间件
 func AuthMiddleware(authService *services.AuthService, publicPathCheckers ...PublicPathChecker) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 检查是否为公开路径（如插件 publicPaths 声明的 Subsonic /rest/* 端点）
 			for _, checker := range publicPathCheckers {
 				if checker != nil && checker.IsPublicPath(r.URL.Path) {
 					next.ServeHTTP(w, r)
@@ -37,8 +88,6 @@ func AuthMiddleware(authService *services.AuthService, publicPathCheckers ...Pub
 			}
 
 			var tokenString string
-
-			// 优先从 Authorization 头获取 token
 			authHeader := r.Header.Get("Authorization")
 			if authHeader != "" {
 				extracted := strings.TrimPrefix(authHeader, "Bearer ")
@@ -47,12 +96,8 @@ func AuthMiddleware(authService *services.AuthService, publicPathCheckers ...Pub
 				}
 			}
 
-			// 回退：从 URL query parameter 获取 token
-			// 用于图片/音频等无法自定义 Header 的场景（如 <img> 标签、CachedNetworkImage）
 			if tokenString == "" {
 				tokenString = r.URL.Query().Get("access_token")
-				// 小爱音箱固件会将 URL 中的 & 替换为空格，导致后续参数被合并进 access_token。
-				// JWT 不含空格，按空格拆分并将被吞掉的参数还原到 query string。
 				if token, remainder, ok := strings.Cut(tokenString, " "); ok {
 					tokenString = token
 					q := r.URL.Query()
@@ -71,18 +116,32 @@ func AuthMiddleware(authService *services.AuthService, publicPathCheckers ...Pub
 				return
 			}
 
-			// 验证 JWT token
 			claims, err := authService.ValidateToken(r.Context(), tokenString)
 			if err != nil {
 				respondAuthError(w, http.StatusUnauthorized, "无效的 token", err)
 				return
 			}
 
-			// 将 claims 信息添加到请求上下文
-			ctx := context.WithValue(r.Context(), "client_id", claims.ClientID)
+			ctx := r.Context()
+			ctx = context.WithValue(ctx, ctxClientID, claims.ClientID)
+			ctx = context.WithValue(ctx, ctxUserID, claims.UserID)
+			ctx = context.WithValue(ctx, ctxRole, claims.Role)
+			ctx = context.WithValue(ctx, ctxUsername, claims.Username)
+			// 兼容旧字符串 key
+			ctx = context.WithValue(ctx, "client_id", claims.ClientID)
 
-			// 认证成功，继续处理请求
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// RequireAdmin 仅允许 admin（及插件 token，claims 已归一化为 admin）。
+func RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !IsAdmin(r.Context()) {
+			respondAuthError(w, http.StatusForbidden, "需要管理员权限", nil)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

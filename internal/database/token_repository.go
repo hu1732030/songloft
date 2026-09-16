@@ -25,7 +25,7 @@ func NewTokenRepository(db sqlc.DBTX) *TokenRepository {
 	return &TokenRepository{db: db, queries: sqlc.New(db)}
 }
 
-// Create 写入新令牌并回填自增 ID。
+// Create 写入新令牌并回填自增 ID；若 token.UserID > 0 则额外写入 user_id。
 func (r *TokenRepository) Create(ctx context.Context, token *models.AuthToken) error {
 	var revokedAt sql.NullTime
 	if !token.RevokedAt.IsZero() {
@@ -45,6 +45,11 @@ func (r *TokenRepository) Create(ctx context.Context, token *models.AuthToken) e
 		return fmt.Errorf("create token: %w", err)
 	}
 	token.ID = id
+	if token.UserID > 0 {
+		if _, err := r.db.ExecContext(ctx, `UPDATE auth_tokens SET user_id = ? WHERE id = ?`, token.UserID, id); err != nil {
+			return fmt.Errorf("set token user_id: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -57,8 +62,13 @@ func (r *TokenRepository) GetByID(ctx context.Context, tokenID string) (*models.
 		}
 		return nil, fmt.Errorf("get token: %w", err)
 	}
-	return tokenRowToModel(row.ID, row.TokenID, row.TokenType, row.ClientInfo,
-		row.ExpiresAt, row.RevokedAt, row.RevokedBy, row.CreatedAt, row.RevokedReason), nil
+	t := tokenRowToModel(row.ID, row.TokenID, row.TokenType, row.ClientInfo,
+		row.ExpiresAt, row.RevokedAt, row.RevokedBy, row.CreatedAt, row.RevokedReason)
+	var userID sql.NullInt64
+	if err := r.db.QueryRowContext(ctx, `SELECT user_id FROM auth_tokens WHERE id = ?`, row.ID).Scan(&userID); err == nil && userID.Valid {
+		t.UserID = userID.Int64
+	}
+	return t, nil
 }
 
 // Revoke 把指定令牌标记为已撤销，找不到返回 ErrNotFound。
@@ -84,13 +94,16 @@ func (r *TokenRepository) ListActive(ctx context.Context, filter *TokenFilter) (
 		filter = &TokenFilter{}
 	}
 	sb := sq.Select("id", "token_id", "token_type", "client_info", "expires_at",
-		"revoked_at", "revoked_by", "created_at", "revoked_reason").
+		"revoked_at", "revoked_by", "created_at", "revoked_reason", "user_id").
 		From("auth_tokens").
 		Where(sq.Eq{"revoked_at": nil}).
 		Where(sq.Gt{"expires_at": time.Now()})
 
 	if filter.TokenType != "" {
 		sb = sb.Where(sq.Eq{"token_type": filter.TokenType})
+	}
+	if filter.UserID > 0 {
+		sb = sb.Where(sq.Eq{"user_id": filter.UserID})
 	}
 
 	sb = applyOrder(sb, filter.OrderBy, filter.Order, "created_at DESC", tokenOrderWhitelist, "")
@@ -115,13 +128,18 @@ func (r *TokenRepository) ListActive(ctx context.Context, filter *TokenFilter) (
 			expiresAt, createdAt           time.Time
 			revokedAt                      sql.NullTime
 			revokedBy, revokedReason       string
+			userID                         sql.NullInt64
 		)
 		if err := rows.Scan(&id, &tokenID, &tokenType, &clientInfo,
-			&expiresAt, &revokedAt, &revokedBy, &createdAt, &revokedReason); err != nil {
+			&expiresAt, &revokedAt, &revokedBy, &createdAt, &revokedReason, &userID); err != nil {
 			return nil, fmt.Errorf("scan token: %w", err)
 		}
-		tokens = append(tokens, tokenRowToModel(id, tokenID, tokenType, clientInfo,
-			expiresAt, revokedAt, revokedBy, createdAt, revokedReason))
+		t := tokenRowToModel(id, tokenID, tokenType, clientInfo,
+			expiresAt, revokedAt, revokedBy, createdAt, revokedReason)
+		if userID.Valid {
+			t.UserID = userID.Int64
+		}
+		tokens = append(tokens, t)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate tokens: %w", err)

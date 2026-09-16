@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"songloft/internal/database/testutil"
+	"songloft/internal/middleware"
 	"songloft/internal/models"
 	"songloft/internal/services"
 )
@@ -27,11 +28,15 @@ func newAuthHandlerForTest(t *testing.T) *AuthHandler {
 		t.Fatalf("seed jwt_secret: %v", err)
 	}
 
-	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb.TokenRepository(), "admin", "password")
+	if err := services.EnsureAdminUser(context.Background(), mdb.UserRepository(), "admin", "password"); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+
+	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb.TokenRepository(), mdb.UserRepository())
 	if err != nil {
 		t.Fatalf("create auth service: %v", err)
 	}
-	return NewAuthHandler(svc)
+	return NewAuthHandler(svc, services.NewCaptchaService())
 }
 
 // TestAuthHandler_Login 测试登录处理器
@@ -205,6 +210,7 @@ func TestAuthHandler_ListTokens(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/auth/tokens", nil)
 	req.Header.Set("Authorization", "Bearer test-access-token")
+	req = req.WithContext(middleware.WithAdminContext(req.Context()))
 
 	rr := httptest.NewRecorder()
 	handler.ListTokens(rr, req)

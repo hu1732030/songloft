@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"songloft/internal/database"
+	"songloft/internal/middleware"
 	"songloft/internal/models"
 	"songloft/internal/services"
 
@@ -37,6 +38,76 @@ func NewPlaylistHandler(playlistService *services.PlaylistService, songService *
 func (h *PlaylistHandler) SetThumbCache(tc *services.CoverThumbCache) {
 	h.thumbCache = tc
 }
+
+// ensurePlaylistWritable admin / 插件可写全部；listener 仅可写自己的歌单（owner_user_id 匹配）。
+func (h *PlaylistHandler) ensurePlaylistWritable(r *http.Request, playlist *models.Playlist) error {
+	if middleware.IsAdmin(r.Context()) {
+		return nil
+	}
+	uid := middleware.UserIDFromContext(r.Context())
+	if uid <= 0 || playlist.OwnerUserID == nil || *playlist.OwnerUserID != uid {
+		return models.ErrPlaylistForbidden
+	}
+	return nil
+}
+
+// ensurePlaylistReadable admin 可读全部；listener 仅可读自己的歌单。
+func (h *PlaylistHandler) ensurePlaylistReadable(r *http.Request, playlist *models.Playlist) error {
+	return h.ensurePlaylistWritable(r, playlist)
+}
+
+func (h *PlaylistHandler) loadWritablePlaylist(w http.ResponseWriter, r *http.Request, id int64) (*models.Playlist, bool) {
+	playlist, err := h.playlistService.GetByID(r.Context(), id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "歌单不存在", err)
+		return nil, false
+	}
+	if err := h.ensurePlaylistWritable(r, playlist); err != nil {
+		respondError(w, http.StatusForbidden, "无权修改该歌单", err)
+		return nil, false
+	}
+	return playlist, true
+}
+
+func (h *PlaylistHandler) loadReadablePlaylist(w http.ResponseWriter, r *http.Request, id int64) (*models.Playlist, bool) {
+	playlist, err := h.playlistService.GetByID(r.Context(), id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "歌单不存在", err)
+		return nil, false
+	}
+	if err := h.ensurePlaylistReadable(r, playlist); err != nil {
+		respondError(w, http.StatusForbidden, "无权查看该歌单", err)
+		return nil, false
+	}
+	return playlist, true
+}
+
+// requireWritablePlaylistID 解析 URL 中的歌单 ID 并校验写权限。
+func (h *PlaylistHandler) requireWritablePlaylistID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+		return 0, false
+	}
+	if _, ok := h.loadWritablePlaylist(w, r, id); !ok {
+		return 0, false
+	}
+	return id, true
+}
+
+// requireReadablePlaylistID 解析 URL 中的歌单 ID 并校验读权限。
+func (h *PlaylistHandler) requireReadablePlaylistID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+		return 0, false
+	}
+	if _, ok := h.loadReadablePlaylist(w, r, id); !ok {
+		return 0, false
+	}
+	return id, true
+}
+
 
 // ListPlaylists 获取歌单列表
 // @Summary 获取歌单列表
@@ -103,6 +174,15 @@ func (h *PlaylistHandler) ListPlaylists(w http.ResponseWriter, r *http.Request) 
 		Limit:         limit,
 		Offset:        offset,
 	}
+	// listener 只看自己的歌单，避免看到全局「收藏」与他人歌单
+	if !middleware.IsAdmin(ctx) {
+		uid := middleware.UserIDFromContext(ctx)
+		if uid <= 0 {
+			respondError(w, http.StatusUnauthorized, "未授权", nil)
+			return
+		}
+		filter.OwnerUserID = &uid
+	}
 
 	playlists, err := h.playlistService.List(ctx, filter)
 	if err != nil {
@@ -115,6 +195,7 @@ func (h *PlaylistHandler) ListPlaylists(w http.ResponseWriter, r *http.Request) 
 		SongSource:    songSource,
 		Keyword:       keyword,
 		ExcludeLabels: excludeLabels,
+		OwnerUserID:   filter.OwnerUserID,
 	}
 	total, err := h.playlistService.Count(ctx, countFilter)
 	if err != nil {
@@ -143,21 +224,15 @@ func (h *PlaylistHandler) ListPlaylists(w http.ResponseWriter, r *http.Request) 
 // @Security BearerAuth
 // @Router /playlists/{id} [get]
 func (h *PlaylistHandler) GetPlaylist(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
 		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
 		return
 	}
-
-	playlist, err := h.playlistService.GetByID(ctx, id)
-	if err != nil {
-		respondError(w, http.StatusNotFound, "歌单不存在", err)
+	playlist, ok := h.loadReadablePlaylist(w, r, id)
+	if !ok {
 		return
 	}
-
 	respondJSON(w, http.StatusOK, playlist)
 }
 
@@ -180,6 +255,24 @@ func (h *PlaylistHandler) CreatePlaylist(w http.ResponseWriter, r *http.Request)
 	if err := json.NewDecoder(r.Body).Decode(&playlist); err != nil {
 		respondError(w, http.StatusBadRequest, "无效的请求数据", err)
 		return
+	}
+
+	// listener 创建的歌单归属自己；admin 创建默认为全局（owner 为空）
+	if !middleware.IsAdmin(ctx) {
+		uid := middleware.UserIDFromContext(ctx)
+		if uid <= 0 {
+			respondError(w, http.StatusUnauthorized, "未授权", nil)
+			return
+		}
+		playlist.OwnerUserID = &uid
+		// 禁止伪造内置标签
+		filtered := playlist.Labels[:0]
+		for _, l := range playlist.Labels {
+			if l != models.PlaylistLabelBuiltIn && l != models.PlaylistLabelAutoCreated {
+				filtered = append(filtered, l)
+			}
+		}
+		playlist.Labels = filtered
 	}
 
 	if err := h.playlistService.Create(ctx, &playlist); err != nil {
@@ -226,6 +319,10 @@ func (h *PlaylistHandler) UpdatePlaylist(w http.ResponseWriter, r *http.Request)
 	existing, err := h.playlistService.GetByID(ctx, id)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "歌单不存在", err)
+		return
+	}
+	if err := h.ensurePlaylistWritable(r, existing); err != nil {
+		respondError(w, http.StatusForbidden, "无权修改该歌单", err)
 		return
 	}
 
@@ -277,9 +374,8 @@ func (h *PlaylistHandler) UpdatePlaylist(w http.ResponseWriter, r *http.Request)
 // @Security BearerAuth
 // @Router /playlists/{id}/song-ids [get]
 func (h *PlaylistHandler) GetPlaylistSongIDs(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil || id <= 0 {
-		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+	id, ok := h.requireReadablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -314,11 +410,8 @@ func (h *PlaylistHandler) GetPlaylistSongIDs(w http.ResponseWriter, r *http.Requ
 // @Router /playlists/{id}/touch [post]
 func (h *PlaylistHandler) TouchPlaylist(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+	id, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -346,9 +439,8 @@ func (h *PlaylistHandler) TouchPlaylist(w http.ResponseWriter, r *http.Request) 
 // @Security BearerAuth
 // @Router /playlists/{id}/sort [put]
 func (h *PlaylistHandler) UpdatePlaylistSort(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil || id <= 0 {
-		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+	id, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -384,15 +476,16 @@ func (h *PlaylistHandler) UpdatePlaylistSort(w http.ResponseWriter, r *http.Requ
 // @Router /playlists/{id} [delete]
 func (h *PlaylistHandler) DeletePlaylist(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+	id, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
 	deleteSongs := r.URL.Query().Get("delete_songs") == "true"
+	// listener 不得连带删除共享曲库歌曲
+	if deleteSongs && !middleware.IsAdmin(r.Context()) {
+		deleteSongs = false
+	}
 
 	// 删歌单前先收集歌单内全部歌曲 ID：歌单删除后 playlist_songs 关联被 FK CASCADE 清空，
 	// 需在此之前拿到候选，才能在删后判定哪些歌曲已无任何归属（孤儿）。
@@ -449,6 +542,16 @@ func (h *PlaylistHandler) BatchDeletePlaylists(w http.ResponseWriter, r *http.Re
 	if len(req.IDs) == 0 {
 		respondError(w, http.StatusBadRequest, "请提供要删除的歌单 ID 列表", nil)
 		return
+	}
+
+	for _, pid := range req.IDs {
+		if _, ok := h.loadWritablePlaylist(w, r, pid); !ok {
+			return
+		}
+	}
+
+	if req.DeleteSongs && !middleware.IsAdmin(r.Context()) {
+		req.DeleteSongs = false
 	}
 
 	// 删歌单前收集所有待删歌单内歌曲 ID 的并集（去重）作为孤儿清理候选。
@@ -511,11 +614,8 @@ func (h *PlaylistHandler) BatchDeletePlaylists(w http.ResponseWriter, r *http.Re
 // @Router /playlists/{id}/songs [get]
 func (h *PlaylistHandler) GetPlaylistSongs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单 ID", err)
+	id, ok := h.requireReadablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -578,11 +678,8 @@ func (h *PlaylistHandler) GetPlaylistSongs(w http.ResponseWriter, r *http.Reques
 // @Router /playlists/{id}/songs [post]
 func (h *PlaylistHandler) AddSongToPlaylist(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-
-	playlistID, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单 ID", err)
+	playlistID, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -628,16 +725,12 @@ func (h *PlaylistHandler) AddSongToPlaylist(w http.ResponseWriter, r *http.Reque
 // @Router /playlists/{id}/songs/{songId} [delete]
 func (h *PlaylistHandler) RemoveSongFromPlaylist(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-	songIdStr := chi.URLParam(r, "songId")
-
-	playlistID, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单 ID", err)
+	playlistID, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
-	songID, err := strconv.ParseInt(songIdStr, 10, 64)
+	songID, err := strconv.ParseInt(chi.URLParam(r, "songId"), 10, 64)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, "无效的歌曲 ID", err)
 		return
@@ -668,11 +761,8 @@ func (h *PlaylistHandler) RemoveSongFromPlaylist(w http.ResponseWriter, r *http.
 // @Router /playlists/{id}/songs/reorder [put]
 func (h *PlaylistHandler) ReorderPlaylistSongs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-
-	playlistID, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单 ID", err)
+	playlistID, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -717,11 +807,8 @@ func (h *PlaylistHandler) ReorderPlaylistSongs(w http.ResponseWriter, r *http.Re
 // @Router /playlists/{id}/songs/sort [post]
 func (h *PlaylistHandler) SortPlaylistSongs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-
-	playlistID, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单 ID", err)
+	playlistID, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -764,11 +851,8 @@ func (h *PlaylistHandler) SortPlaylistSongs(w http.ResponseWriter, r *http.Reque
 // @Router /playlists/{id}/songs/move [put]
 func (h *PlaylistHandler) MovePlaylistSong(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	idStr := chi.URLParam(r, "id")
-
-	playlistID, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单 ID", err)
+	playlistID, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -854,15 +938,14 @@ func (h *PlaylistHandler) ReorderPlaylists(w http.ResponseWriter, r *http.Reques
 // @Security BearerAuth
 // @Router /playlists/{id}/cover [post]
 func (h *PlaylistHandler) UploadPlaylistCover(w http.ResponseWriter, r *http.Request) {
-	// 1. 解析歌单 ID
-	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+	// 1. 解析歌单 ID 并校验写权限
+	id, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
 	// 2. 解析 multipart form-data（限制 10MB）
-	err = r.ParseMultipartForm(10 << 20)
+	err := r.ParseMultipartForm(10 << 20)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, "解析表单数据失败", err)
 		return
@@ -922,15 +1005,13 @@ func (h *PlaylistHandler) UploadPlaylistCover(w http.ResponseWriter, r *http.Req
 func (h *PlaylistHandler) GetPlaylistCover(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
+	if err != nil || id <= 0 {
 		respondError(w, http.StatusBadRequest, "无效的 ID", err)
 		return
 	}
 
-	// 获取歌单信息
-	playlist, err := h.playlistService.GetByID(r.Context(), id)
-	if err != nil {
-		respondError(w, http.StatusNotFound, "歌单不存在", err)
+	playlist, ok := h.loadReadablePlaylist(w, r, id)
+	if !ok {
 		return
 	}
 
@@ -994,9 +1075,8 @@ func coverFileExists(path string) bool {
 func (h *PlaylistHandler) SetPlaylistVisibility(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+	id, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 
@@ -1064,9 +1144,8 @@ func (h *PlaylistHandler) SetPlaylistVisibility(w http.ResponseWriter, r *http.R
 // @Security BearerAuth
 // @Router /playlists/{id}/pin [put]
 func (h *PlaylistHandler) SetPlaylistPinned(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, "无效的歌单ID", err)
+	id, ok := h.requireWritablePlaylistID(w, r)
+	if !ok {
 		return
 	}
 

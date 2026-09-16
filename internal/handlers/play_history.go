@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"songloft/internal/database"
+	"songloft/internal/middleware"
 	"songloft/internal/models"
 	"songloft/internal/services"
 )
@@ -20,10 +21,6 @@ func NewPlayHistoryHandler(service *services.PlayHistoryService) *PlayHistoryHan
 	return &PlayHistoryHandler{service: service}
 }
 
-// parsePlayContext 从 query 解析并校验播放上下文，失败时已写好响应并返回 false。
-//
-// context_key 走 query 而不是路径参数：歌手/专辑名里含 "/"、"%" 等字符，
-// 放进 URL 路径会有编解码歧义（前端路由出于同样原因也把分面 value 放在 query）。
 func parsePlayContext(w http.ResponseWriter, r *http.Request) (string, string, bool) {
 	contextType := r.URL.Query().Get("context_type")
 	contextKey := r.URL.Query().Get("context_key")
@@ -39,23 +36,21 @@ func parsePlayContext(w http.ResponseWriter, r *http.Request) (string, string, b
 	return contextType, contextKey, true
 }
 
-// GetPlayHistory 查询某播放上下文的最近播放记录。
-// @Summary 查询播放上下文的播放历史
-// @Description 返回指定播放上下文内最近播放过的歌曲，按最后播放时间倒序，含完整歌曲详情。
-// @Description 「播放上下文」由 context_type + context_key 二元组标识：歌单为 (playlist, 歌单 ID)，自定义标签为 (tag, 标签 ID)，分面维度为 (artist, 歌手名) / (album, 专辑名) 等。
-// @Description 同一上下文内按歌曲去重（重复播放只刷新时间并累加 play_count），最多保留最近 50 条，因此本端点不分页。
-// @Description 记录由 POST /songs/{id}/played 在 type=play 时写入。歌曲从库中删除时其历史自动级联清理；歌曲仅被移出歌单时历史仍保留，客户端起播时自行判定失效。
-// @Tags 播放历史
-// @Produce json
-// @Param context_type query string true "播放上下文类型" Enums(playlist, tag, artist, album, genre, year, decade, language, style)
-// @Param context_key query string true "播放上下文标识：playlist 传歌单 ID，分面维度传该维度取值"
-// @Param limit query int false "返回条数，缺省 50，上限 50"
-// @Success 200 {object} models.PlayHistoryListResponse "成功返回播放历史列表"
-// @Failure 400 {object} models.ErrorResponse "context_type 不支持或缺少 context_key"
-// @Failure 500 {object} models.ErrorResponse "服务器错误"
-// @Security BearerAuth
-// @Router /play-history [get]
+func requireHistoryUserID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	uid := middleware.UserIDFromContext(r.Context())
+	if uid <= 0 {
+		respondError(w, http.StatusUnauthorized, "未授权", nil)
+		return 0, false
+	}
+	return uid, true
+}
+
+// GetPlayHistory 查询某播放上下文的最近播放记录（按当前用户隔离）。
 func (h *PlayHistoryHandler) GetPlayHistory(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requireHistoryUserID(w, r)
+	if !ok {
+		return
+	}
 	contextType, contextKey, ok := parsePlayContext(w, r)
 	if !ok {
 		return
@@ -66,7 +61,7 @@ func (h *PlayHistoryHandler) GetPlayHistory(w http.ResponseWriter, r *http.Reque
 		limit = l
 	}
 
-	entries, err := h.service.List(r.Context(), contextType, contextKey, limit)
+	entries, err := h.service.List(r.Context(), userID, contextType, contextKey, limit)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "获取播放历史失败", err)
 		return
@@ -78,25 +73,18 @@ func (h *PlayHistoryHandler) GetPlayHistory(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// ClearPlayHistory 清空某播放上下文的播放历史。
-// @Summary 清空播放上下文的播放历史
-// @Description 删除指定播放上下文内的全部播放记录，返回实际删除条数。上下文不存在或本就没有记录时返回 deleted=0，不视为错误。
-// @Tags 播放历史
-// @Produce json
-// @Param context_type query string true "播放上下文类型" Enums(playlist, tag, artist, album, genre, year, decade, language, style)
-// @Param context_key query string true "播放上下文标识：playlist 传歌单 ID，分面维度传该维度取值"
-// @Success 200 {object} map[string]int "成功返回 {deleted: 删除条数}"
-// @Failure 400 {object} models.ErrorResponse "context_type 不支持或缺少 context_key"
-// @Failure 500 {object} models.ErrorResponse "服务器错误"
-// @Security BearerAuth
-// @Router /play-history [delete]
+// ClearPlayHistory 清空某播放上下文的播放历史（仅当前用户）。
 func (h *PlayHistoryHandler) ClearPlayHistory(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requireHistoryUserID(w, r)
+	if !ok {
+		return
+	}
 	contextType, contextKey, ok := parsePlayContext(w, r)
 	if !ok {
 		return
 	}
 
-	deleted, err := h.service.Clear(r.Context(), contextType, contextKey)
+	deleted, err := h.service.Clear(r.Context(), userID, contextType, contextKey)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "清空播放历史失败", err)
 		return
@@ -105,21 +93,12 @@ func (h *PlayHistoryHandler) ClearPlayHistory(w http.ResponseWriter, r *http.Req
 	respondJSON(w, http.StatusOK, map[string]int{"deleted": deleted})
 }
 
-// DeletePlayHistoryEntry 删除单条播放历史记录。
-// @Summary 删除单条播放历史
-// @Description 从指定播放上下文中删除某首歌的播放记录。典型用途：清理已被移出歌单、在历史面板里显示为失效的条目。
-// @Tags 播放历史
-// @Produce json
-// @Param context_type query string true "播放上下文类型" Enums(playlist, tag, artist, album, genre, year, decade, language, style)
-// @Param context_key query string true "播放上下文标识：playlist 传歌单 ID，分面维度传该维度取值"
-// @Param song_id query int true "要删除的歌曲 ID"
-// @Success 204 "删除成功，无内容"
-// @Failure 400 {object} models.ErrorResponse "context_type 不支持、缺少 context_key 或无效的 song_id"
-// @Failure 404 {object} models.ErrorResponse "该上下文中不存在此歌曲的播放记录"
-// @Failure 500 {object} models.ErrorResponse "服务器错误"
-// @Security BearerAuth
-// @Router /play-history/entry [delete]
+// DeletePlayHistoryEntry 删除单条播放历史记录（仅当前用户）。
 func (h *PlayHistoryHandler) DeletePlayHistoryEntry(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requireHistoryUserID(w, r)
+	if !ok {
+		return
+	}
 	contextType, contextKey, ok := parsePlayContext(w, r)
 	if !ok {
 		return
@@ -131,7 +110,7 @@ func (h *PlayHistoryHandler) DeletePlayHistoryEntry(w http.ResponseWriter, r *ht
 		return
 	}
 
-	if err := h.service.DeleteEntry(r.Context(), contextType, contextKey, songID); err != nil {
+	if err := h.service.DeleteEntry(r.Context(), userID, contextType, contextKey, songID); err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			respondError(w, http.StatusNotFound, "播放历史记录不存在", err)
 			return

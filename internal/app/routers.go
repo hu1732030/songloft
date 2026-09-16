@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"songloft/internal/handlers"
 	app_middleware "songloft/internal/middleware"
@@ -31,12 +32,13 @@ func (a *App) setupRouter() {
 	// API 转发路由（需要认证，publicPaths 声明的路径除外）
 	a.router.Group(func(r chi.Router) {
 		r.Use(app_middleware.AuthMiddleware(a.authService, a.jsPluginManager))
+		r.Use(app_middleware.RestrictGuest)
 		a.jsPluginManager.RegisterAPIRoutes(r)
 	})
 }
 
 func (a *App) setupAPIV1Router() {
-	authHandler := handlers.NewAuthHandler(a.authService)
+	authHandler := handlers.NewAuthHandler(a.authService, services.NewCaptchaService())
 	hlsHandler := handlers.NewHLSHandler(a.songService, a.configService)
 	videoHLSHandler := handlers.NewVideoHLSHandler(a.songService, a.cacheService)
 	songHandler := handlers.NewSongHandler(
@@ -113,10 +115,17 @@ func (a *App) setupAPIV1Router() {
 		a.db,
 	)
 
+	tagHandler := handlers.NewSongTagHandler(a.songTagService, a.songService, a.configService)
+
 	a.router.Route("/api/v1", func(r chi.Router) {
-		// 认证模块路由
+		// 公开认证入口
 		r.Post("/auth/login", authHandler.Login)
 		r.Post("/auth/refresh", authHandler.RefreshToken)
+		r.Get("/auth/captcha", authHandler.GetCaptcha)
+		r.Post("/auth/register", authHandler.Register)
+		// 游客签发：每 IP 每分钟最多 5 次
+		guestLimiter := app_middleware.NewIPRateLimiter(5, time.Minute)
+		r.With(guestLimiter.Middleware).Post("/auth/guest", authHandler.GuestLogin)
 
 		// 版本信息
 		r.Get("/version", versionHandler.GetVersion)
@@ -127,21 +136,19 @@ func (a *App) setupAPIV1Router() {
 		// 需要授权的路由组
 		r.Group(func(r chi.Router) {
 			r.Use(app_middleware.AuthMiddleware(a.authService))
+			r.Use(app_middleware.RestrictGuest)
 
-			// 认证相关
+			// —— listener + admin 共用 ——
 			r.Post("/auth/logout", authHandler.Logout)
+			r.Put("/auth/password", authHandler.ChangePassword)
 			r.Get("/auth/tokens", authHandler.ListTokens)
 			r.Get("/auth/tokens/{token_id}", authHandler.GetTokenInfo)
 			r.Delete("/auth/tokens/{token_id}", authHandler.RevokeToken)
 
-			// 歌曲管理模块
+			// 曲库只读 + 播放相关
 			r.Get("/songs", songHandler.ListSongs)
 			r.Get("/songs/ids", songHandler.ListSongIDs)
 			r.Get("/songs/random", songHandler.ListRandomSongs)
-			r.Post("/songs/remote", songHandler.AddRemoteSongs)
-			r.Post("/songs/radio", songHandler.AddRadios)
-			r.Post("/songs/clean", songHandler.CleanInvalidSongs)
-			r.Post("/songs/batch-delete", songHandler.BatchDeleteSongs)
 			r.Get("/songs/duplicates", songHandler.GetDuplicates)
 			r.Get("/songs/facets", songHandler.ListSongFacets)
 			r.Get("/songs/folders", songHandler.ListFolders)
@@ -151,36 +158,32 @@ func (a *App) setupAPIV1Router() {
 			r.Get("/songs/{id}/artists", songHandler.GetSongArtists)
 			r.Get("/songs/{id}/audio-tracks", songHandler.GetSongAudioTracks)
 			r.Get("/songs/{id}/tracks", songHandler.GetSongTracks)
-			r.Put("/songs/{id}", songHandler.UpdateSong)
-			r.Delete("/songs/{id}", songHandler.DeleteSong)
-			r.Put("/songs/{id}/artists", songHandler.SetSongArtists)
-			r.Put("/songs/{id}/lyrics", songHandler.UpdateSongLyrics)
-			r.Put("/songs/{id}/tags", songHandler.WriteTags)
-			r.Post("/songs/organize", songHandler.OrganizeSongs)
-			r.Post("/songs/organize/preview", songHandler.PreviewOrganizeSongs)
 			r.Post("/songs/{id}/activate", songHandler.ActivateSong)
 			r.Post("/songs/{id}/played", songHandler.SongPlayed)
-			r.Get("/settings/remote-title-source", songHandler.GetRemoteTitleSourceSetting)
-			r.Put("/settings/remote-title-source", songHandler.UpdateRemoteTitleSourceSetting)
-			r.Get("/settings/volume-normalize", songHandler.GetVolumeNormalizeSetting)
-			r.Put("/settings/volume-normalize", songHandler.UpdateVolumeNormalizeSetting)
-			r.Post("/songs/refresh-metadata", songHandler.StartMetadataRefresh)
-			r.Get("/songs/refresh-metadata/progress", songHandler.GetMetadataRefreshProgress)
-			r.Post("/songs/refresh-metadata/cancel", songHandler.CancelMetadataRefresh)
+			r.Get("/songs/{id}/play", songHandler.GetSongPlay)
+			r.Head("/songs/{id}/play", songHandler.GetSongPlay)
+			r.Get("/songs/{id}/play.m3u8", songHandler.GetSongPlay)
+			r.Head("/songs/{id}/play.m3u8", songHandler.GetSongPlay)
+			r.Get("/songs/{id}/hls/playlist", hlsHandler.HandlePlaylist)
+			r.Head("/songs/{id}/hls/playlist", hlsHandler.HandlePlaylist)
+			r.Get("/songs/{id}/hls/segment", hlsHandler.HandleSegment)
+			r.Head("/songs/{id}/hls/segment", hlsHandler.HandleSegment)
+			r.Get("/songs/{id}/video-hls/playlist.m3u8", videoHLSHandler.GetPlaylist)
+			r.Get("/songs/{id}/video-hls/*", videoHLSHandler.GetResource)
+			r.Get("/songs/{id}/cover", songHandler.GetSongCover)
+			r.Get("/songs/{id}/lyric", songHandler.GetSongLyric)
+			r.Get("/songs/{id}/song-tags", tagHandler.GetSongTags)
 
-			// 歌单管理模块
-			backupHandler := handlers.NewBackupHandler(a.backupService)
-			r.Get("/playlists/export", backupHandler.ExportPlaylists)
-			r.Post("/playlists/import", backupHandler.ImportPlaylists)
+			r.Get("/proxy", proxyHandler.Proxy)
+			r.Get("/proxy/transcode", proxyHandler.Transcode)
+
+			// 歌单：读 + 自有歌单写（handler 内校验 owner）
 			r.Get("/playlists", playlistHandler.ListPlaylists)
 			r.Post("/playlists", playlistHandler.CreatePlaylist)
-			r.Put("/playlists/reorder", playlistHandler.ReorderPlaylists)
 			r.Get("/playlists/{id}", playlistHandler.GetPlaylist)
 			r.Put("/playlists/{id}", playlistHandler.UpdatePlaylist)
 			r.Delete("/playlists/{id}", playlistHandler.DeletePlaylist)
 			r.Post("/playlists/batch-delete", playlistHandler.BatchDeletePlaylists)
-
-			// 歌单内歌曲操作
 			r.Get("/playlists/{id}/songs", playlistHandler.GetPlaylistSongs)
 			r.Get("/playlists/{id}/song-ids", playlistHandler.GetPlaylistSongIDs)
 			r.Post("/playlists/{id}/songs", playlistHandler.AddSongToPlaylist)
@@ -195,148 +198,149 @@ func (a *App) setupAPIV1Router() {
 			r.Post("/playlists/{id}/cover", playlistHandler.UploadPlaylistCover)
 			r.Get("/playlists/{id}/cover", playlistHandler.GetPlaylistCover)
 
-			// 自定义标签管理
-			tagHandler := handlers.NewSongTagHandler(a.songTagService, a.songService, a.configService)
-			r.Get("/song-tags", tagHandler.List)
-			r.Post("/song-tags", tagHandler.Create)
-			r.Get("/song-tags/{id}", tagHandler.Get)
-			r.Put("/song-tags/{id}", tagHandler.Update)
-			r.Delete("/song-tags/{id}", tagHandler.Delete)
-			r.Get("/song-tags/{id}/songs", tagHandler.ListSongs)
-			r.Get("/song-tags/{id}/song-ids", tagHandler.ListSongIDs)
-			r.Post("/song-tags/{id}/bind", tagHandler.BatchBind)
-			r.Post("/song-tags/{id}/unbind", tagHandler.BatchUnbind)
-
-			r.Get("/songs/{id}/song-tags", tagHandler.GetSongTags)
-			r.Put("/songs/{id}/song-tags", tagHandler.SetSongTags)
-			r.Get("/settings/tag-sync-to-file", tagHandler.GetTagSyncToFile)
-			r.Put("/settings/tag-sync-to-file", tagHandler.UpdateTagSyncToFile)
-
-			// 播放历史（按播放上下文：歌单 / 歌手 / 专辑 / 其余分面维度）
+			// 播放历史 / 个人偏好（按 user_id 隔离）
 			r.Get("/play-history", playHistoryHandler.GetPlayHistory)
 			r.Delete("/play-history", playHistoryHandler.ClearPlayHistory)
 			r.Delete("/play-history/entry", playHistoryHandler.DeletePlayHistoryEntry)
 
-			// 主题包管理
-			r.Get("/theme-packs", themePackHandler.ListThemePacks)
-			r.Post("/theme-packs", themePackHandler.ImportThemePack)
-			r.Get("/theme-packs/active", themePackHandler.GetActiveThemePack)
-			r.Put("/theme-packs/active", themePackHandler.SetActiveThemePack)
-			r.Delete("/theme-packs/active", themePackHandler.ClearActiveThemePack)
-			r.Post("/theme-packs/catalog/refresh", themePackHandler.RefreshCatalog)
-			r.Post("/theme-packs/catalog/install", themePackHandler.InstallFromCatalog)
-			r.Get("/theme-packs/{themeID}", themePackHandler.GetThemePack)
-			r.Delete("/theme-packs/{themeID}", themePackHandler.DeleteThemePack)
-			r.Get("/settings/theme-catalog-url", themePackHandler.GetCatalogURLSetting)
-			r.Put("/settings/theme-catalog-url", themePackHandler.UpdateCatalogURLSetting)
-
-			r.Get("/settings/hls-proxy", hlsHandler.GetProxySetting)
-			r.Put("/settings/hls-proxy", hlsHandler.UpdateProxySetting)
-			r.Get("/settings/proxy-private-allowlist", proxyHandler.GetProxyAllowlistSetting)
-			r.Put("/settings/proxy-private-allowlist", proxyHandler.UpdateProxyAllowlistSetting)
-			r.Get("/settings/music-path", scanHandler.GetMusicPathSetting)
-			r.Put("/settings/music-path", scanHandler.UpdateMusicPathSetting)
-			r.Get("/settings/scan-playlist-mode", scanHandler.GetPlaylistModeSetting)
-			r.Put("/settings/scan-playlist-mode", scanHandler.UpdatePlaylistModeSetting)
-			r.Get("/settings/scan-auto-create-playlists", scanHandler.GetAutoCreatePlaylistsSetting)
-			r.Put("/settings/scan-auto-create-playlists", scanHandler.UpdateAutoCreatePlaylistsSetting)
-			r.Get("/settings/scan-title-source", scanHandler.GetScanTitleSourceSetting)
-			r.Put("/settings/scan-title-source", scanHandler.UpdateScanTitleSourceSetting)
-			r.Get("/settings/scan-auto-fingerprint", scanHandler.GetScanAutoFingerprintSetting)
-			r.Put("/settings/scan-auto-fingerprint", scanHandler.UpdateScanAutoFingerprintSetting)
-			r.Get("/settings/auto-scan", scanHandler.GetAutoScanSetting)
-			r.Put("/settings/auto-scan", scanHandler.UpdateAutoScanSetting)
-			r.Get("/settings/log-level", logHandler.GetLevelSetting)
-			r.Put("/settings/log-level", logHandler.UpdateLevelSetting)
-			r.Get("/logs/export", logExportHandler.ExportLogs)
-			r.Get("/settings/plugin-registries", jsPluginHandler.GetRegistriesSetting)
-			r.Put("/settings/plugin-registries", jsPluginHandler.UpdateRegistriesSetting)
-			r.Get("/settings/http-proxy", jsPluginHandler.GetHttpProxySetting)
-			r.Put("/settings/http-proxy", jsPluginHandler.UpdateHttpProxySetting)
-			r.Get("/settings/github-proxy", upgradeHandler.GetGithubProxySetting)
-			r.Put("/settings/github-proxy", upgradeHandler.UpdateGithubProxySetting)
-			r.Get("/settings/plugin-keep-alive", jsPluginHandler.GetPluginKeepAliveSetting)
-			r.Put("/settings/plugin-keep-alive", jsPluginHandler.UpdatePluginKeepAliveSetting)
-			r.Get("/settings/plugin-auto-update", jsPluginHandler.GetPluginAutoUpdateSetting)
-			r.Put("/settings/plugin-auto-update", jsPluginHandler.UpdatePluginAutoUpdateSetting)
-			r.Get("/settings/tab-config", configHandler.GetTabConfigSetting)
-			r.Put("/settings/tab-config", configHandler.UpdateTabConfigSetting)
-			r.Get("/settings/library-browse", configHandler.GetLibraryBrowseSetting)
-			r.Put("/settings/library-browse", configHandler.UpdateLibraryBrowseSetting)
 			r.Get("/settings/user-preferences", configHandler.GetUserPreferencesSetting)
 			r.Put("/settings/user-preferences", configHandler.UpdateUserPreferencesSetting)
 			r.Get("/settings/equalizer", configHandler.GetEqualizerSetting)
 			r.Put("/settings/equalizer", configHandler.UpdateEqualizerSetting)
+			r.Get("/settings/library-browse", configHandler.GetLibraryBrowseSetting)
+			r.Put("/settings/library-browse", configHandler.UpdateLibraryBrowseSetting)
+			r.Get("/settings/volume-normalize", songHandler.GetVolumeNormalizeSetting)
 
-			// 配置管理模块
-			r.Get("/configs", configHandler.ListConfigs)
-			r.Post("/configs", configHandler.CreateConfig)
-			r.Get("/configs/{key}", configHandler.GetConfig)
-			r.Put("/configs/{key}", configHandler.UpdateConfig)
-			r.Delete("/configs/{key}", configHandler.DeleteConfig)
+			// 标签只读（浏览曲库）
+			r.Get("/song-tags", tagHandler.List)
+			r.Get("/song-tags/{id}", tagHandler.Get)
+			r.Get("/song-tags/{id}/songs", tagHandler.ListSongs)
+			r.Get("/song-tags/{id}/song-ids", tagHandler.ListSongIDs)
 
-			// 扫描管理模块
-			r.Post("/scan", scanHandler.ScanAndImport)
-			r.Get("/scan/progress", scanHandler.GetScanProgress)
-			r.Post("/scan/cancel", scanHandler.CancelScan)
-			r.Get("/scan/directories", scanHandler.ListDirectories)
-			r.Get("/scan/dir-names", scanHandler.ListDirNames)
-			r.Get("/scan/fingerprints/status", scanHandler.GetFingerprintStatus)
-			r.Post("/scan/fingerprints", scanHandler.StartFingerprintCompute)
-			r.Get("/scan/fingerprints/progress", scanHandler.GetFingerprintProgress)
-			r.Post("/scan/fingerprints/cancel", scanHandler.CancelFingerprintCompute)
-			r.Get("/scan/fingerprints/failed", scanHandler.GetFailedFingerprints)
+			// 主题：仅读取当前激活主题（听歌端可能需要）
+			r.Get("/theme-packs/active", themePackHandler.GetActiveThemePack)
 
-			// 资源代理模块（解决外部 CDN 的 CORS 问题）
-			r.Get("/proxy", proxyHandler.Proxy)
-			// 转码代理：服务端拉远程音频→ffmpeg 实时转 mp3 流式返回（no-import 场景下音箱不可解码的直链）
-			r.Get("/proxy/transcode", proxyHandler.Transcode)
+			// —— 仅 admin ——
+			r.Group(func(r chi.Router) {
+				r.Use(app_middleware.RequireAdmin)
 
-			// 歌曲播放端点（流式返回音频，支持 local/remote/radio 三种类型）
-			r.Get("/songs/{id}/play", songHandler.GetSongPlay)
-			r.Head("/songs/{id}/play", songHandler.GetSongPlay)
-			// HLS 电台专用别名:URL 必须以 .m3u8 结尾，否则 ExoPlayer/AVPlayer 不识别为 HLS。
-			// 仅作字面后缀变体存在,handler 内部按 song.Type 走同一分发逻辑。
-			r.Get("/songs/{id}/play.m3u8", songHandler.GetSongPlay)
-			r.Head("/songs/{id}/play.m3u8", songHandler.GetSongPlay)
+				r.Get("/users", authHandler.ListUsers)
+				r.Put("/users/{id}/password", authHandler.AdminResetPassword)
+				r.Patch("/users/{id}/status", authHandler.AdminSetUserStatus)
 
-			// HLS 反向代理端点（hls_proxy_mode=proxy 时启用，由 serveRadio 改写后的 m3u8 内回链触发）
-			r.Get("/songs/{id}/hls/playlist", hlsHandler.HandlePlaylist)
-			r.Head("/songs/{id}/hls/playlist", hlsHandler.HandlePlaylist)
-			r.Get("/songs/{id}/hls/segment", hlsHandler.HandleSegment)
-			r.Head("/songs/{id}/hls/segment", hlsHandler.HandleSegment)
+				r.Post("/songs/remote", songHandler.AddRemoteSongs)
+				r.Post("/songs/radio", songHandler.AddRadios)
+				r.Post("/songs/clean", songHandler.CleanInvalidSongs)
+				r.Post("/songs/batch-delete", songHandler.BatchDeleteSongs)
+				r.Put("/songs/{id}", songHandler.UpdateSong)
+				r.Delete("/songs/{id}", songHandler.DeleteSong)
+				r.Put("/songs/{id}/artists", songHandler.SetSongArtists)
+				r.Put("/songs/{id}/lyrics", songHandler.UpdateSongLyrics)
+				r.Put("/songs/{id}/tags", songHandler.WriteTags)
+				r.Post("/songs/organize", songHandler.OrganizeSongs)
+				r.Post("/songs/organize/preview", songHandler.PreviewOrganizeSongs)
+				r.Get("/settings/remote-title-source", songHandler.GetRemoteTitleSourceSetting)
+				r.Put("/settings/remote-title-source", songHandler.UpdateRemoteTitleSourceSetting)
+				r.Put("/settings/volume-normalize", songHandler.UpdateVolumeNormalizeSetting)
+				r.Post("/songs/refresh-metadata", songHandler.StartMetadataRefresh)
+				r.Get("/songs/refresh-metadata/progress", songHandler.GetMetadataRefreshProgress)
+				r.Post("/songs/refresh-metadata/cancel", songHandler.CancelMetadataRefresh)
 
-			// 视频 HLS 转码端点（Web 端播放浏览器不原生支持的视频格式）
-			r.Get("/songs/{id}/video-hls/playlist.m3u8", videoHLSHandler.GetPlaylist)
-			r.Get("/songs/{id}/video-hls/*", videoHLSHandler.GetResource)
+				backupHandler := handlers.NewBackupHandler(a.backupService)
+				r.Get("/playlists/export", backupHandler.ExportPlaylists)
+				r.Post("/playlists/import", backupHandler.ImportPlaylists)
+				r.Put("/playlists/reorder", playlistHandler.ReorderPlaylists)
 
-			// 歌曲封面端点（本地歌曲返回封面文件，网络歌曲由 CoverURL 直接指向外部 CDN）
-			r.Get("/songs/{id}/cover", songHandler.GetSongCover)
+				r.Post("/song-tags", tagHandler.Create)
+				r.Put("/song-tags/{id}", tagHandler.Update)
+				r.Delete("/song-tags/{id}", tagHandler.Delete)
+				r.Post("/song-tags/{id}/bind", tagHandler.BatchBind)
+				r.Post("/song-tags/{id}/unbind", tagHandler.BatchUnbind)
+				r.Put("/songs/{id}/song-tags", tagHandler.SetSongTags)
+				r.Get("/settings/tag-sync-to-file", tagHandler.GetTagSyncToFile)
+				r.Put("/settings/tag-sync-to-file", tagHandler.UpdateTagSyncToFile)
 
-			// 歌曲歌词端点（根据 lyric_source 分发到 URL 下载或直接返回缓存文本）
-			r.Get("/songs/{id}/lyric", songHandler.GetSongLyric)
+				r.Get("/theme-packs", themePackHandler.ListThemePacks)
+				r.Post("/theme-packs", themePackHandler.ImportThemePack)
+				r.Put("/theme-packs/active", themePackHandler.SetActiveThemePack)
+				r.Delete("/theme-packs/active", themePackHandler.ClearActiveThemePack)
+				r.Post("/theme-packs/catalog/refresh", themePackHandler.RefreshCatalog)
+				r.Post("/theme-packs/catalog/install", themePackHandler.InstallFromCatalog)
+				r.Get("/theme-packs/{themeID}", themePackHandler.GetThemePack)
+				r.Delete("/theme-packs/{themeID}", themePackHandler.DeleteThemePack)
+				r.Get("/settings/theme-catalog-url", themePackHandler.GetCatalogURLSetting)
+				r.Put("/settings/theme-catalog-url", themePackHandler.UpdateCatalogURLSetting)
 
-			// 音乐缓存管理（独立前缀，避免与 /cache/{hash} 冲突）
-			r.Get("/cache-manage/stats", cacheHandler.HandleGetCacheStats)
-			r.Post("/cache-manage/clean", cacheHandler.HandleCleanCache)
-			r.Get("/cache-manage/config", cacheHandler.HandleGetCacheConfig)
-			r.Put("/cache-manage/config", cacheHandler.HandleUpdateCacheConfig)
-			r.Post("/cache-manage/validate-dir", cacheHandler.HandleValidateCacheDir)
+				r.Get("/settings/hls-proxy", hlsHandler.GetProxySetting)
+				r.Put("/settings/hls-proxy", hlsHandler.UpdateProxySetting)
+				r.Get("/settings/proxy-private-allowlist", proxyHandler.GetProxyAllowlistSetting)
+				r.Put("/settings/proxy-private-allowlist", proxyHandler.UpdateProxyAllowlistSetting)
+				r.Get("/settings/music-path", scanHandler.GetMusicPathSetting)
+				r.Put("/settings/music-path", scanHandler.UpdateMusicPathSetting)
+				r.Get("/settings/scan-playlist-mode", scanHandler.GetPlaylistModeSetting)
+				r.Put("/settings/scan-playlist-mode", scanHandler.UpdatePlaylistModeSetting)
+				r.Get("/settings/scan-auto-create-playlists", scanHandler.GetAutoCreatePlaylistsSetting)
+				r.Put("/settings/scan-auto-create-playlists", scanHandler.UpdateAutoCreatePlaylistsSetting)
+				r.Get("/settings/scan-title-source", scanHandler.GetScanTitleSourceSetting)
+				r.Put("/settings/scan-title-source", scanHandler.UpdateScanTitleSourceSetting)
+				r.Get("/settings/scan-auto-fingerprint", scanHandler.GetScanAutoFingerprintSetting)
+				r.Put("/settings/scan-auto-fingerprint", scanHandler.UpdateScanAutoFingerprintSetting)
+				r.Get("/settings/auto-scan", scanHandler.GetAutoScanSetting)
+				r.Put("/settings/auto-scan", scanHandler.UpdateAutoScanSetting)
+				r.Get("/settings/log-level", logHandler.GetLevelSetting)
+				r.Put("/settings/log-level", logHandler.UpdateLevelSetting)
+				r.Get("/logs/export", logExportHandler.ExportLogs)
+				r.Get("/settings/plugin-registries", jsPluginHandler.GetRegistriesSetting)
+				r.Put("/settings/plugin-registries", jsPluginHandler.UpdateRegistriesSetting)
+				r.Get("/settings/http-proxy", jsPluginHandler.GetHttpProxySetting)
+				r.Put("/settings/http-proxy", jsPluginHandler.UpdateHttpProxySetting)
+				r.Get("/settings/github-proxy", upgradeHandler.GetGithubProxySetting)
+				r.Put("/settings/github-proxy", upgradeHandler.UpdateGithubProxySetting)
+				r.Get("/settings/plugin-keep-alive", jsPluginHandler.GetPluginKeepAliveSetting)
+				r.Put("/settings/plugin-keep-alive", jsPluginHandler.UpdatePluginKeepAliveSetting)
+				r.Get("/settings/plugin-auto-update", jsPluginHandler.GetPluginAutoUpdateSetting)
+				r.Put("/settings/plugin-auto-update", jsPluginHandler.UpdatePluginAutoUpdateSetting)
+				r.Get("/settings/tab-config", configHandler.GetTabConfigSetting)
+				r.Put("/settings/tab-config", configHandler.UpdateTabConfigSetting)
 
-			// 升级管理模块
-			r.Get("/upgrade/versions", upgradeHandler.GetVersions)
-			r.Get("/upgrade/check", upgradeHandler.CheckUpdate)
-			r.Post("/upgrade/start", upgradeHandler.StartUpgrade)
-			r.Post("/upgrade/upload", upgradeHandler.UploadBinary)
-			r.Post("/upgrade/upload/confirm", upgradeHandler.ConfirmUploadUpgrade)
-			r.Post("/upgrade/reset", upgradeHandler.ResetToBaseImage)
-			r.Get("/upgrade/progress", upgradeHandler.GetUpgradeProgress)
+				r.Get("/configs", configHandler.ListConfigs)
+				r.Post("/configs", configHandler.CreateConfig)
+				r.Get("/configs/{key}", configHandler.GetConfig)
+				r.Put("/configs/{key}", configHandler.UpdateConfig)
+				r.Delete("/configs/{key}", configHandler.DeleteConfig)
+
+				r.Post("/scan", scanHandler.ScanAndImport)
+				r.Get("/scan/progress", scanHandler.GetScanProgress)
+				r.Post("/scan/cancel", scanHandler.CancelScan)
+				r.Get("/scan/directories", scanHandler.ListDirectories)
+				r.Get("/scan/dir-names", scanHandler.ListDirNames)
+				r.Get("/scan/fingerprints/status", scanHandler.GetFingerprintStatus)
+				r.Post("/scan/fingerprints", scanHandler.StartFingerprintCompute)
+				r.Get("/scan/fingerprints/progress", scanHandler.GetFingerprintProgress)
+				r.Post("/scan/fingerprints/cancel", scanHandler.CancelFingerprintCompute)
+				r.Get("/scan/fingerprints/failed", scanHandler.GetFailedFingerprints)
+
+				r.Get("/cache-manage/stats", cacheHandler.HandleGetCacheStats)
+				r.Post("/cache-manage/clean", cacheHandler.HandleCleanCache)
+				r.Get("/cache-manage/config", cacheHandler.HandleGetCacheConfig)
+				r.Put("/cache-manage/config", cacheHandler.HandleUpdateCacheConfig)
+				r.Post("/cache-manage/validate-dir", cacheHandler.HandleValidateCacheDir)
+
+				r.Get("/upgrade/versions", upgradeHandler.GetVersions)
+				r.Get("/upgrade/check", upgradeHandler.CheckUpdate)
+				r.Post("/upgrade/start", upgradeHandler.StartUpgrade)
+				r.Post("/upgrade/upload", upgradeHandler.UploadBinary)
+				r.Post("/upgrade/upload/confirm", upgradeHandler.ConfirmUploadUpgrade)
+				r.Post("/upgrade/reset", upgradeHandler.ResetToBaseImage)
+				r.Get("/upgrade/progress", upgradeHandler.GetUpgradeProgress)
+			})
 		})
 	})
 
 	// JS 插件管理（RegisterRoutes 内部已定义完整路径 /api/v1/jsplugins，需在根路由上注册）
 	a.router.Group(func(r chi.Router) {
 		r.Use(app_middleware.AuthMiddleware(a.authService))
+		r.Use(app_middleware.RequireAdmin)
 		jsPluginHandler.RegisterRoutes(r)
 	})
 }

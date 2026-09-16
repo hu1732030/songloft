@@ -19,6 +19,7 @@ import (
 
 	"songloft/internal/database"
 	"songloft/internal/httputil"
+	"songloft/internal/middleware"
 	"songloft/internal/models"
 	"songloft/internal/services"
 	"songloft/internal/services/playactivity"
@@ -41,9 +42,9 @@ type CoverSearcher interface {
 	SearchCover(ctx context.Context, title, artist, album string, fingerprint string, isrc string) (string, error)
 }
 
-// PlayHistoryRecorder 记录「某播放上下文内播了某首歌」（由 PlayHistoryService 实现）
+// PlayHistoryRecorder 记录「某用户 × 播放上下文内播了某首歌」
 type PlayHistoryRecorder interface {
-	Record(ctx context.Context, contextType, contextKey string, songID int64, playedAt time.Time) error
+	Record(ctx context.Context, userID int64, contextType, contextKey string, songID int64, playedAt time.Time) error
 }
 
 // SongHandler 歌曲处理器
@@ -3041,9 +3042,10 @@ func (h *SongHandler) SongPlayed(w http.ResponseWriter, r *http.Request) {
 		contextType := r.URL.Query().Get("context_type")
 		contextKey := r.URL.Query().Get("context_key")
 		if contextType != "" && contextKey != "" {
-			if err := h.playHistory.Record(r.Context(), contextType, contextKey, song.ID, time.Now()); err != nil {
+			userID := middleware.UserIDFromContext(r.Context())
+			if err := h.playHistory.Record(r.Context(), userID, contextType, contextKey, song.ID, time.Now()); err != nil {
 				slog.Warn("记录播放历史失败",
-					"song_id", song.ID, "context_type", contextType, "context_key", contextKey, "error", err)
+					"song_id", song.ID, "user_id", userID, "context_type", contextType, "context_key", contextKey, "error", err)
 			}
 		}
 	}
