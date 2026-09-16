@@ -2,7 +2,6 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,10 +18,6 @@ import (
 )
 
 const (
-	// GitHub Release 版本文件 URL
-	stableVersionURL = "https://github.com/songloft-org/songloft/releases/latest/download/version.json"
-	devVersionURL    = "https://github.com/songloft-org/songloft/releases/download/dev/version.json"
-
 	versionTypeStable = "stable"
 	versionTypeDev    = "dev"
 	buildTypeFull     = "full"
@@ -62,36 +57,15 @@ func (s *UpgradeService) IsDockerEnvironment() bool {
 
 // FetchVersionInfo 获取指定版本的信息
 // proxyPrefix 为 GitHub 代理前缀，为空则直连；代理请求失败时自动降级直连重试一次
+// 自建部署已禁用：不再请求 GitHub Release。
 func (s *UpgradeService) FetchVersionInfo(versionType string, proxyPrefix string) (*models.RemoteVersionInfo, error) {
-	var rawURL string
-	switch versionType {
-	case versionTypeStable:
-		rawURL = stableVersionURL
-	case versionTypeDev:
-		rawURL = devVersionURL
-	default:
-		return nil, fmt.Errorf("invalid version type: %s", versionType)
-	}
+	return nil, fmt.Errorf("remote version check via GitHub is disabled")
+}
 
-	// 检查更新只拉取很小的 version.json，用独立的短超时避免网络不通时长时间转圈
-	// （下载二进制的 DownloadBinary 仍复用 httpClient 的 10 分钟超时）
-	resp, err := httputil.GetWithGithubProxyFallback(context.Background(), s.httpClient, rawURL, proxyPrefix,
-		httputil.GithubGetOptions{AttemptTimeout: 12 * time.Second})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch version info: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch version info: status code %d", resp.StatusCode)
-	}
-
-	var versionInfo models.RemoteVersionInfo
-	if err := json.NewDecoder(resp.Body).Decode(&versionInfo); err != nil {
-		return nil, fmt.Errorf("failed to decode version info: %w", err)
-	}
-
-	return &versionInfo, nil
+// CheckForUpdates 检查是否有可用更新
+// 自建部署已禁用远程 GitHub 检查，始终返回「无可用更新」。
+func (s *UpgradeService) CheckForUpdates(proxyPrefix string) (map[string]*models.RemoteVersionInfo, error) {
+	return map[string]*models.RemoteVersionInfo{}, nil
 }
 
 // normalizeVersion 去掉版本号前缀 "v"，方便比较
@@ -248,24 +222,6 @@ func (s *UpgradeService) isNewerVersion(versionType string, remoteInfo *models.R
 	}
 
 	return compareReleaseVersions(remoteInfo.Version, version.Version) > 0
-}
-
-// CheckForUpdates 检查是否有可用更新
-// proxyPrefix 为 GitHub 代理前缀，为空则直连
-// 拉取失败（网络不通 / 超时 / 非 200）会返回错误，避免上层把失败误判为「已是最新」
-func (s *UpgradeService) CheckForUpdates(proxyPrefix string) (map[string]*models.RemoteVersionInfo, error) {
-	result := make(map[string]*models.RemoteVersionInfo)
-	versionType := s.CurrentVersionType()
-
-	versionInfo, err := s.FetchVersionInfo(versionType, proxyPrefix)
-	if err != nil {
-		return nil, err
-	}
-	if s.isNewerVersion(versionType, versionInfo) {
-		result[versionType] = versionInfo
-	}
-
-	return result, nil
 }
 
 // getBaseImageBuildType 获取 Docker 底包的构建类型
