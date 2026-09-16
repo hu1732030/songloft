@@ -24,6 +24,7 @@ type DB interface {
 	ThemePackRepository() *ThemePackRepository
 	SongTagRepository() *SongTagRepository
 	SongArtistRepository() *SongArtistRepository
+	GuestSecurityRepository() *GuestSecurityRepository
 }
 
 // NewSQLiteDB 兼容旧调用方的构造函数，内部委托给 Open。

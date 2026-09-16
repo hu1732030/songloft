@@ -166,6 +166,17 @@ func (h *PlaylistHandler) ListPlaylists(w http.ResponseWriter, r *http.Request) 
 		excludeLabels = strings.Split(excludeLabelsStr, ",")
 	}
 
+	// 游客无 user_id：返回空列表（200），禁止用 401（会触发前端 refresh/登出踢回登录页）
+	if middleware.IsGuest(r) {
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"playlists": []*models.Playlist{},
+			"total":     0,
+			"limit":     limit,
+			"offset":    offset,
+		})
+		return
+	}
+
 	filter := &database.PlaylistFilter{
 		Type:          playlistType,
 		SongSource:    songSource,
@@ -259,6 +270,10 @@ func (h *PlaylistHandler) CreatePlaylist(w http.ResponseWriter, r *http.Request)
 
 	// listener 创建的歌单归属自己；admin 创建默认为全局（owner 为空）
 	if !middleware.IsAdmin(ctx) {
+		if middleware.IsGuest(r) {
+			respondError(w, http.StatusForbidden, "游客不可创建歌单", nil)
+			return
+		}
 		uid := middleware.UserIDFromContext(ctx)
 		if uid <= 0 {
 			respondError(w, http.StatusUnauthorized, "未授权", nil)

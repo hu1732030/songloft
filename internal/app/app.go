@@ -46,6 +46,7 @@ type App struct {
 	songTagService     *services.SongTagService
 	themePackService   *services.ThemePackService
 	authService        *services.AuthService
+	guestSecurity      *services.GuestSecurityService
 	upgradeService     *services.UpgradeService
 	cacheService       *services.CacheService
 	backupService      *services.BackupService
@@ -286,6 +287,7 @@ func (a *App) Init() error {
 		return fmt.Errorf("创建认证服务失败: %w", err)
 	}
 	a.authService = authService
+	a.guestSecurity = services.NewGuestSecurityService(db.GuestSecurityRepository())
 	a.authService.SetOnUserCreated(func(ctx context.Context, userID int64) error {
 		return services.EnsureUserBuiltinPlaylists(ctx, db.PlaylistRepository(), userID)
 	})

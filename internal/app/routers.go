@@ -38,7 +38,8 @@ func (a *App) setupRouter() {
 }
 
 func (a *App) setupAPIV1Router() {
-	authHandler := handlers.NewAuthHandler(a.authService, services.NewCaptchaService())
+	authHandler := handlers.NewAuthHandler(a.authService, services.NewCaptchaService(), a.guestSecurity)
+	guestSecHandler := handlers.NewGuestSecurityHandler(a.guestSecurity)
 	hlsHandler := handlers.NewHLSHandler(a.songService, a.configService)
 	videoHLSHandler := handlers.NewVideoHLSHandler(a.songService, a.cacheService)
 	songHandler := handlers.NewSongHandler(
@@ -123,9 +124,10 @@ func (a *App) setupAPIV1Router() {
 		r.Post("/auth/refresh", authHandler.RefreshToken)
 		r.Get("/auth/captcha", authHandler.GetCaptcha)
 		r.Post("/auth/register", authHandler.Register)
-		// 游客签发：每 IP 每分钟最多 5 次
+		// 游客签发：黑名单 + 每 IP 每分钟最多 5 次
 		guestLimiter := app_middleware.NewIPRateLimiter(5, time.Minute)
-		r.With(guestLimiter.Middleware).Post("/auth/guest", authHandler.GuestLogin)
+		r.With(app_middleware.GuestLoginGuard(a.guestSecurity, guestLimiter)).
+			Post("/auth/guest", authHandler.GuestLogin)
 
 		// 版本信息
 		r.Get("/version", versionHandler.GetVersion)
@@ -136,6 +138,7 @@ func (a *App) setupAPIV1Router() {
 		// 需要授权的路由组
 		r.Group(func(r chi.Router) {
 			r.Use(app_middleware.AuthMiddleware(a.authService))
+			r.Use(app_middleware.BlockBannedGuest(a.guestSecurity))
 			r.Use(app_middleware.RestrictGuest)
 
 			// —— listener + admin 共用 ——
@@ -227,6 +230,12 @@ func (a *App) setupAPIV1Router() {
 				r.Get("/users", authHandler.ListUsers)
 				r.Put("/users/{id}/password", authHandler.AdminResetPassword)
 				r.Patch("/users/{id}/status", authHandler.AdminSetUserStatus)
+
+				r.Get("/guest/bans", guestSecHandler.ListBans)
+				r.Post("/guest/bans", guestSecHandler.CreateBan)
+				r.Delete("/guest/bans/{id}", guestSecHandler.DeleteBan)
+				r.Get("/guest/audit", guestSecHandler.ListAudit)
+				r.Post("/guest/bans/from-audit/{id}", guestSecHandler.BanFromAudit)
 
 				r.Post("/songs/remote", songHandler.AddRemoteSongs)
 				r.Post("/songs/radio", songHandler.AddRadios)

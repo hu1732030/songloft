@@ -244,6 +244,7 @@ func (s *AuthService) GuestLogin(ctx context.Context, clientInfo string) (*model
 		UserID:       0,
 		Username:     guest.Username,
 		Role:         models.UserRoleGuest,
+		ClientID:     clientID,
 	}, nil
 }
 

@@ -193,3 +193,8 @@ func (s *SQLiteDB) SongTagRepository() *SongTagRepository {
 func (s *SQLiteDB) SongArtistRepository() *SongArtistRepository {
 	return NewSongArtistRepository(s.db)
 }
+
+// GuestSecurityRepository 返回游客黑名单/审计仓储
+func (s *SQLiteDB) GuestSecurityRepository() *GuestSecurityRepository {
+	return NewGuestSecurityRepository(s.db)
+}

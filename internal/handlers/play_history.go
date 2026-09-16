@@ -37,6 +37,10 @@ func parsePlayContext(w http.ResponseWriter, r *http.Request) (string, string, b
 }
 
 func requireHistoryUserID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	if middleware.IsGuest(r) {
+		respondError(w, http.StatusForbidden, "游客无播放历史", nil)
+		return 0, false
+	}
 	uid := middleware.UserIDFromContext(r.Context())
 	if uid <= 0 {
 		respondError(w, http.StatusUnauthorized, "未授权", nil)

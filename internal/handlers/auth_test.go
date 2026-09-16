@@ -36,7 +36,7 @@ func newAuthHandlerForTest(t *testing.T) *AuthHandler {
 	if err != nil {
 		t.Fatalf("create auth service: %v", err)
 	}
-	return NewAuthHandler(svc, services.NewCaptchaService())
+	return NewAuthHandler(svc, services.NewCaptchaService(), nil)
 }
 
 // TestAuthHandler_Login 测试登录处理器

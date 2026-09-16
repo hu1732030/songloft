@@ -67,6 +67,9 @@ var (
 
 	// ErrCannotDisableAdmin 表示禁止禁用管理员账号
 	ErrCannotDisableAdmin = errors.New("cannot disable admin user")
+
+	// ErrGuestBanned 表示 IP / client_id 在游客黑名单中
+	ErrGuestBanned = errors.New("guest access banned")
 )
 
 // 认证相关常量
@@ -629,6 +632,7 @@ type LoginResponse struct {
 	UserID       int64  `json:"user_id" example:"1"`                                             // 用户 ID
 	Username     string `json:"username" example:"admin"`                                        // 用户名
 	Role         string `json:"role" example:"admin" enums:"admin,listener"`                     // 角色
+	ClientID     string `json:"client_id,omitempty"`                                             // 会话 client_id（游客审计用）
 }
 
 // RegisterRequest 注册请求（仅创建 listener）
@@ -643,6 +647,52 @@ type RegisterRequest struct {
 type GuestLoginRequest struct {
 	CaptchaID   string `json:"captcha_id" example:"a1b2c3d4" binding:"required"`
 	CaptchaCode string `json:"captcha_code" example:"AB12" binding:"required"`
+}
+
+// 游客黑名单 kind
+const (
+	GuestBanKindIP       = "ip"
+	GuestBanKindClientID = "client_id"
+)
+
+// 游客审计事件类型（仅登录相关，不记听歌）
+const (
+	GuestAuditLoginOK     = "login_ok"
+	GuestAuditLoginFail   = "login_fail"
+	GuestAuditRateLimited = "rate_limited"
+	GuestAuditBanned      = "banned"
+	GuestAuditCaptchaFail = "captcha_fail"
+)
+
+// GuestBan 游客黑名单条目
+type GuestBan struct {
+	ID        int64      `json:"id"`
+	Kind      string     `json:"kind"` // ip | client_id
+	Value     string     `json:"value"`
+	Reason    string     `json:"reason"`
+	CreatedBy *int64     `json:"created_by,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Enabled   bool       `json:"enabled"`
+}
+
+// CreateGuestBanRequest 管理员创建黑名单
+type CreateGuestBanRequest struct {
+	Kind      string  `json:"kind" binding:"required"` // ip | client_id
+	Value     string  `json:"value" binding:"required"`
+	Reason    string  `json:"reason"`
+	ExpiresAt *string `json:"expires_at,omitempty"` // RFC3339，空=永久
+}
+
+// GuestAuditEvent 游客登录审计事件
+type GuestAuditEvent struct {
+	ID        int64     `json:"id"`
+	Event     string    `json:"event"`
+	IP        string    `json:"ip"`
+	ClientID  string    `json:"client_id"`
+	UserAgent string    `json:"user_agent"`
+	Detail    string    `json:"detail"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ChangePasswordRequest 修改当前用户密码

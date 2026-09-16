@@ -18,13 +18,19 @@ import (
 type AuthHandler struct {
 	authService    *services.AuthService
 	captchaService *services.CaptchaService
+	guestSecurity  *services.GuestSecurityService
 }
 
 // NewAuthHandler 创建认证处理器
-func NewAuthHandler(authService *services.AuthService, captchaService *services.CaptchaService) *AuthHandler {
+func NewAuthHandler(
+	authService *services.AuthService,
+	captchaService *services.CaptchaService,
+	guestSecurity *services.GuestSecurityService,
+) *AuthHandler {
 	return &AuthHandler{
 		authService:    authService,
 		captchaService: captchaService,
+		guestSecurity:  guestSecurity,
 	}
 }
 
@@ -97,27 +103,42 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 // @Router /auth/guest [post]
 func (h *AuthHandler) GuestLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ip := middleware.ClientIP(r)
+	ua := r.UserAgent()
 
 	var req models.GuestLoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if h.guestSecurity != nil {
+			h.guestSecurity.LogEvent(models.GuestAuditLoginFail, ip, "", ua, "invalid body")
+		}
 		respondError(w, http.StatusBadRequest, "无效的请求数据", err)
 		return
 	}
 
 	if err := h.captchaService.Verify(req.CaptchaID, req.CaptchaCode); err != nil {
+		if h.guestSecurity != nil {
+			h.guestSecurity.LogEvent(models.GuestAuditCaptchaFail, ip, "", ua, "")
+		}
 		respondError(w, http.StatusBadRequest, "验证码错误或已过期", err)
 		return
 	}
 
-	clientInfo := r.UserAgent()
+	clientInfo := ua
 	if clientInfo == "" {
 		clientInfo = r.RemoteAddr
 	}
 
 	resp, err := h.authService.GuestLogin(ctx, clientInfo)
 	if err != nil {
+		if h.guestSecurity != nil {
+			h.guestSecurity.LogEvent(models.GuestAuditLoginFail, ip, "", ua, err.Error())
+		}
 		respondError(w, http.StatusInternalServerError, "游客登录失败", err)
 		return
+	}
+
+	if h.guestSecurity != nil {
+		h.guestSecurity.LogEvent(models.GuestAuditLoginOK, ip, resp.ClientID, ua, "")
 	}
 
 	respondJSON(w, http.StatusOK, resp)
