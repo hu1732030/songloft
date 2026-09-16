@@ -655,13 +655,15 @@ const (
 	GuestBanKindClientID = "client_id"
 )
 
-// 游客审计事件类型（仅登录相关，不记听歌）
+// 登录审计事件类型（仅登录相关，不记听歌；含游客与正式用户）
 const (
 	GuestAuditLoginOK     = "login_ok"
 	GuestAuditLoginFail   = "login_fail"
 	GuestAuditRateLimited = "rate_limited"
 	GuestAuditBanned      = "banned"
 	GuestAuditCaptchaFail = "captcha_fail"
+	UserAuditLoginOK      = "user_login_ok"
+	UserAuditLoginFail    = "user_login_fail"
 )
 
 // GuestBan 游客黑名单条目

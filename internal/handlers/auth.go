@@ -64,26 +64,48 @@ func (h *AuthHandler) GetCaptcha(w http.ResponseWriter, r *http.Request) {
 // @Router /auth/login [post]
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ip := middleware.ClientIP(r)
+	ua := r.UserAgent()
 
 	var req models.LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if h.guestSecurity != nil {
+			h.guestSecurity.LogEvent(models.UserAuditLoginFail, ip, "", ua, "invalid body")
+		}
 		respondError(w, http.StatusBadRequest, "无效的请求数据", err)
 		return
 	}
 
-	clientInfo := r.UserAgent()
+	clientInfo := ua
 	if clientInfo == "" {
 		clientInfo = r.RemoteAddr
 	}
 
 	resp, err := h.authService.Login(ctx, req.Username, req.Password, clientInfo)
 	if err != nil {
+		detail := "user=" + req.Username
 		if errors.Is(err, models.ErrUserDisabled) {
+			if h.guestSecurity != nil {
+				h.guestSecurity.LogEvent(models.UserAuditLoginFail, ip, "", ua, detail+" disabled")
+			}
 			respondError(w, http.StatusForbidden, "账号已禁用", err)
 			return
 		}
+		if h.guestSecurity != nil {
+			h.guestSecurity.LogEvent(models.UserAuditLoginFail, ip, "", ua, detail)
+		}
 		respondError(w, http.StatusUnauthorized, "用户名或密码错误", err)
 		return
+	}
+
+	if h.guestSecurity != nil {
+		h.guestSecurity.LogEvent(
+			models.UserAuditLoginOK,
+			ip,
+			"",
+			ua,
+			"user="+resp.Username+" role="+resp.Role,
+		)
 	}
 
 	respondJSON(w, http.StatusOK, resp)
