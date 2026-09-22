@@ -478,12 +478,12 @@ func (h *PlaylistHandler) UpdatePlaylistSort(w http.ResponseWriter, r *http.Requ
 
 // DeletePlaylist 删除歌单
 // @Summary 删除歌单
-// @Description 根据歌单ID删除歌单。delete_songs=true 时，同时删除仅属于本歌单的孤儿歌曲（不属于任何其他歌单，含内置的收藏/电台收藏保护）——本地歌曲连同磁盘文件一并删除，网络/电台歌曲清理数据库记录与缓存。
+// @Description 根据歌单ID删除歌单。delete_songs=true 时，同时删除仅属于本歌单的孤儿歌曲（不属于任何其他歌单，含内置的收藏/电台收藏保护）——仅删曲库记录，不删磁盘音频文件。
 // @Tags 歌单管理
 // @Accept json
 // @Produce json
 // @Param id path int true "歌单ID"
-// @Param delete_songs query bool false "是否一并删除仅属于本歌单的孤儿歌曲（含本地文件），默认 false"
+// @Param delete_songs query bool false "是否一并删除仅属于本歌单的孤儿歌曲（仅曲库，不删本地文件），默认 false"
 // @Success 200 {object} map[string]interface{} "删除成功，含连带清理的歌曲数 deleted_songs"
 // @Failure 400 {object} map[string]string "无效的歌单ID"
 // @Failure 500 {object} map[string]string "删除失败"
@@ -520,7 +520,7 @@ func (h *PlaylistHandler) DeletePlaylist(w http.ResponseWriter, r *http.Request)
 
 	deletedSongs := 0
 	if deleteSongs && len(candidateIDs) > 0 {
-		if n, err := h.songService.DeleteOrphanSongs(ctx, candidateIDs, true); err != nil {
+		if n, err := h.songService.DeleteOrphanSongs(ctx, candidateIDs, false); err != nil {
 			slog.Warn("清理孤儿歌曲失败", "playlistId", id, "error", err)
 		} else {
 			deletedSongs = n
@@ -535,7 +535,7 @@ func (h *PlaylistHandler) DeletePlaylist(w http.ResponseWriter, r *http.Request)
 
 // BatchDeletePlaylists 批量删除歌单
 // @Summary 批量删除歌单
-// @Description 根据歌单 ID 列表批量删除歌单，内置歌单会被跳过。请求体 delete_songs=true 时，同时删除仅属于这些歌单的孤儿歌曲（不属于任何其他歌单）——本地歌曲连同磁盘文件一并删除。
+// @Description 根据歌单 ID 列表批量删除歌单，内置歌单会被跳过。请求体 delete_songs=true 时，同时删除仅属于这些歌单的孤儿歌曲（不属于任何其他歌单）——仅删曲库记录，不删磁盘音频文件。
 // @Tags 歌单管理
 // @Accept json
 // @Produce json
@@ -597,7 +597,7 @@ func (h *PlaylistHandler) BatchDeletePlaylists(w http.ResponseWriter, r *http.Re
 
 	deletedSongs := 0
 	if req.DeleteSongs && len(candidateIDs) > 0 {
-		if n, err := h.songService.DeleteOrphanSongs(ctx, candidateIDs, true); err != nil {
+		if n, err := h.songService.DeleteOrphanSongs(ctx, candidateIDs, false); err != nil {
 			slog.Warn("清理孤儿歌曲失败", "playlistIds", req.IDs, "error", err)
 		} else {
 			deletedSongs = n

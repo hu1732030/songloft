@@ -745,7 +745,7 @@ const (
 // BatchDeleteSongsRequest 批量删除歌曲请求
 type BatchDeleteSongsRequest struct {
 	IDs         []int64 `json:"ids" example:"1"`              // 要删除的歌曲 ID 列表
-	DeleteFiles bool    `json:"delete_files" example:"false"` // 是否同步删除本地音频文件
+	DeleteFiles bool    `json:"delete_files" example:"false"` // 已废弃：忽略，不再删除本地音频文件
 }
 
 // BatchDeleteSongsResponse 批量删除歌曲响应
@@ -756,7 +756,7 @@ type BatchDeleteSongsResponse struct {
 // BatchDeletePlaylistsRequest 批量删除歌单请求
 type BatchDeletePlaylistsRequest struct {
 	IDs         []int64 `json:"ids" example:"1"`              // 要删除的歌单 ID 列表
-	DeleteSongs bool    `json:"delete_songs" example:"false"` // 为 true 时，一并删除仅属于被删歌单的孤儿歌曲（含本地歌曲及其磁盘文件）
+	DeleteSongs bool    `json:"delete_songs" example:"false"` // 为 true 时，一并删除仅属于被删歌单的孤儿歌曲（仅曲库记录，不删磁盘音频）
 }
 
 // BatchDeletePlaylistsResponse 批量删除歌单响应

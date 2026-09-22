@@ -286,14 +286,13 @@ func TestSongServiceDelete(t *testing.T) {
 	}
 }
 
-// TestSongServiceDeleteSharedFilePath 验证多条本地歌曲行指向同一 file_path 时，
-// deleteFiles=true 删除其中一条不会误删仍被另一条引用的物理文件；两条都删后文件才被删。
+// TestSongServiceDeleteSharedFilePath 验证删除曲库记录时永不删除磁盘音频文件
+//（即便传入 deleteFiles=true）。
 func TestSongServiceDeleteSharedFilePath(t *testing.T) {
 	repo := newTestSongRepo(t)
 	service := NewSongService(repo, nil, nil, nil, nil, nil)
 	ctx := context.Background()
 
-	// 真实临时文件，两条歌曲行共用同一 file_path。
 	shared := filepath.Join(t.TempDir(), "shared.mp3")
 	if err := os.WriteFile(shared, []byte("dummy"), 0644); err != nil {
 		t.Fatalf("write shared file: %v", err)
@@ -306,31 +305,28 @@ func TestSongServiceDeleteSharedFilePath(t *testing.T) {
 		}
 	}
 
-	// 删 A（deleteFiles=true）：B 仍引用同一文件，文件必须保留。
 	if err := service.Delete(ctx, a.ID, true); err != nil {
 		t.Fatalf("Delete(A) error = %v", err)
 	}
 	if _, err := os.Stat(shared); err != nil {
-		t.Fatalf("shared file should be kept while song B still references it, stat err = %v", err)
+		t.Fatalf("audio file must never be deleted, stat err = %v", err)
 	}
 
-	// 删 B（deleteFiles=true）：不再有引用，文件应被删除。
 	if err := service.Delete(ctx, b.ID, true); err != nil {
 		t.Fatalf("Delete(B) error = %v", err)
 	}
-	if _, err := os.Stat(shared); !os.IsNotExist(err) {
-		t.Errorf("shared file should be deleted after last reference removed, stat err = %v", err)
+	if _, err := os.Stat(shared); err != nil {
+		t.Errorf("audio file must remain after all song rows deleted, stat err = %v", err)
 	}
 }
 
-// TestSongServiceBatchDeleteSharedFilePath 验证 BatchDelete 场景下：同一 file_path 若同时被
-// 删除集合外的歌曲引用则保留；集合内两条共用同一文件且外部无引用时删除。
+// TestSongServiceBatchDeleteSharedFilePath 验证 BatchDelete 即便 deleteFiles=true
+// 也不删除磁盘音频文件。
 func TestSongServiceBatchDeleteSharedFilePath(t *testing.T) {
 	repo := newTestSongRepo(t)
 	service := NewSongService(repo, nil, nil, nil, nil, nil)
 	ctx := context.Background()
 
-	// 场景1：keepFile 被删除集合外的 keeper 引用 → 删 target 不删文件。
 	keepFile := filepath.Join(t.TempDir(), "keep.mp3")
 	if err := os.WriteFile(keepFile, []byte("dummy"), 0644); err != nil {
 		t.Fatalf("write keep file: %v", err)
@@ -346,10 +342,9 @@ func TestSongServiceBatchDeleteSharedFilePath(t *testing.T) {
 		t.Fatalf("BatchDelete error = %v", err)
 	}
 	if _, err := os.Stat(keepFile); err != nil {
-		t.Errorf("keepFile should be kept (still referenced by keeper), stat err = %v", err)
+		t.Errorf("keepFile should be kept, stat err = %v", err)
 	}
 
-	// 场景2：delFile 仅被删除集合内两条共用，外部无引用 → 文件删除。
 	delFile := filepath.Join(t.TempDir(), "del.mp3")
 	if err := os.WriteFile(delFile, []byte("dummy"), 0644); err != nil {
 		t.Fatalf("write del file: %v", err)
@@ -364,8 +359,8 @@ func TestSongServiceBatchDeleteSharedFilePath(t *testing.T) {
 	if _, err := service.BatchDelete(ctx, []int64{c.ID, d.ID}, true); err != nil {
 		t.Fatalf("BatchDelete error = %v", err)
 	}
-	if _, err := os.Stat(delFile); !os.IsNotExist(err) {
-		t.Errorf("delFile should be deleted (no remaining reference), stat err = %v", err)
+	if _, err := os.Stat(delFile); err != nil {
+		t.Errorf("delFile must never be deleted, stat err = %v", err)
 	}
 }
 

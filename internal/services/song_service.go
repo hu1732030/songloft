@@ -272,8 +272,9 @@ func displayArtistFromInputs(inputs []models.ArtistInput) string {
 	return database.JoinDisplayArtists(names)
 }
 
-// Delete 删除歌曲
+// Delete 删除歌曲（仅删曲库记录；永不删除磁盘上的音频文件）。
 func (s *SongService) Delete(ctx context.Context, id int64, deleteFiles bool) error {
+	_ = deleteFiles // 兼容旧客户端参数；策略上禁止删除本地音频文件
 	song, err := s.GetByID(ctx, id)
 	if err != nil {
 		return fmt.Errorf("failed to get song: %w", err)
@@ -285,9 +286,6 @@ func (s *SongService) Delete(ctx context.Context, id int64, deleteFiles bool) er
 
 	if song != nil && song.CoverPath != "" {
 		removeCoverIfUnreferenced(ctx, s.songs, song.CoverPath)
-	}
-	if deleteFiles && song != nil && song.Type == models.TypeLocal && song.FilePath != "" && song.CueSourcePath == "" {
-		s.removeLocalFileIfUnreferenced(ctx, song.FilePath)
 	}
 	if s.cacheService != nil {
 		cachePath := ""
@@ -301,15 +299,15 @@ func (s *SongService) Delete(ctx context.Context, id int64, deleteFiles bool) er
 	return nil
 }
 
-// BatchDelete 批量删除歌曲。deleteFiles 为 true 时同步删除本地音频文件。
+// BatchDelete 批量删除歌曲（仅删曲库记录；永不删除磁盘上的音频文件）。
 func (s *SongService) BatchDelete(ctx context.Context, ids []int64, deleteFiles bool) (int, error) {
+	_ = deleteFiles // 兼容旧客户端参数；策略上禁止删除本地音频文件
 	if len(ids) == 0 {
 		return 0, nil
 	}
 
 	coverPathSet := make(map[string]struct{})
 	cachePaths := make(map[int64]string)
-	filePathSet := make(map[string]struct{})
 
 	songs, err := s.songs.ListByIDs(ctx, ids)
 	if err != nil {
@@ -322,9 +320,6 @@ func (s *SongService) BatchDelete(ctx context.Context, ids []int64, deleteFiles 
 		if song.CachePath != "" {
 			cachePaths[song.ID] = song.CachePath
 		}
-		if deleteFiles && song.Type == models.TypeLocal && song.FilePath != "" && song.CueSourcePath == "" {
-			filePathSet[song.FilePath] = struct{}{}
-		}
 	}
 
 	deleted, err := s.songs.BatchDelete(ctx, ids)
@@ -334,9 +329,6 @@ func (s *SongService) BatchDelete(ctx context.Context, ids []int64, deleteFiles 
 
 	for coverPath := range coverPathSet {
 		removeCoverIfUnreferenced(ctx, s.songs, coverPath)
-	}
-	for fp := range filePathSet {
-		s.removeLocalFileIfUnreferenced(ctx, fp)
 	}
 	if s.cacheService != nil {
 		for _, id := range ids {
@@ -351,9 +343,9 @@ func (s *SongService) BatchDelete(ctx context.Context, ids []int64, deleteFiles 
 // DeleteOrphanSongs 从 candidateIDs 中筛出"孤儿"歌曲（不属于任何歌单）并删除，返回实际删除条数。
 // 供删除歌单后清理"仅属于被删歌单"的残留歌曲用：调用方在删歌单前收集歌单内全部歌曲 ID 作为
 // candidateIDs，歌单删除后其 playlist_songs 关联已被 FK CASCADE 清空，此处筛出的即真正无归属的歌曲。
-// deleteFiles=true 时 BatchDelete 会一并删除本地歌曲的磁盘文件（仅对 type=local 生效），
-// 并清理缓存与不再被引用的封面。
+// 仅删除曲库记录与缓存/无引用封面，不删除磁盘音频文件。
 func (s *SongService) DeleteOrphanSongs(ctx context.Context, candidateIDs []int64, deleteFiles bool) (int, error) {
+	_ = deleteFiles
 	if len(candidateIDs) == 0 {
 		return 0, nil
 	}
@@ -364,31 +356,7 @@ func (s *SongService) DeleteOrphanSongs(ctx context.Context, candidateIDs []int6
 	if len(orphans) == 0 {
 		return 0, nil
 	}
-	return s.BatchDelete(ctx, orphans, deleteFiles)
-}
-
-// removeLocalFileIfUnreferenced 删除本地歌曲的物理文件，但仅当没有其他 song 行仍引用同一 file_path 时。
-// 调用时机：DB 行已删除之后（Delete/BatchDelete 都先删行再删文件），此时若 CountSongsByFilePath 仍 > 0，
-// 说明存在另一条指向同一文件的歌曲行（如手动重复导入 / 插件路径碰撞），必须保留文件避免误删。
-// 查询失败时保守跳过删除（宁可残留也不误删）。仅应对已判定为「本地、非 CUE、file_path 非空」的歌曲调用。
-func (s *SongService) removeLocalFileIfUnreferenced(ctx context.Context, filePath string) {
-	if filePath == "" {
-		return
-	}
-	refs, err := s.songs.CountSongsByFilePath(ctx, filePath)
-	if err != nil {
-		slog.Warn("查询文件引用计数失败,跳过删除音频文件", "path", filePath, "error", err)
-		return
-	}
-	if refs > 0 {
-		slog.Info("音频文件仍被其他歌曲引用,跳过删除", "path", filePath, "refs", refs)
-		return
-	}
-	if err := os.Remove(filePath); err != nil {
-		slog.Warn("删除音频文件失败", "path", filePath, "error", err)
-		return
-	}
-	slog.Info("已删除音频文件", "path", filePath)
+	return s.BatchDelete(ctx, orphans, false)
 }
 
 // coverReferenceCounter 让 removeCoverIfUnreferenced 既能被 SongRepository
@@ -1560,9 +1528,9 @@ type OrganizePreviewResult struct {
 }
 
 // organizePlan 是单项整理经校验后的计划。
-// 说明：song.FilePath 由扫描器存储为「以 music_path 为根的完整路径」（可直接用于 os 操作，
-// 见 BatchDelete 的 os.Remove(song.FilePath)）。因此 absSource 直接取 song.FilePath，
-// 而 newPath = Join(musicPath, target_path) 保持同一种根格式，写回 DB 后与扫描格式一致。
+// 说明：song.FilePath 由扫描器存储为「以 music_path 为根的完整路径」（可直接用于 os 操作）。
+// 因此 absSource 直接取 song.FilePath，而 newPath = Join(musicPath, target_path)
+// 保持同一种根格式，写回 DB 后与扫描格式一致。
 type organizePlan struct {
 	song      *models.Song
 	newPath   string // 移动后写回 DB 的 file_path（Join(musicPath, target_path)，与扫描格式一致）

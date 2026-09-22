@@ -688,7 +688,7 @@ func TestPlaylistServiceAddSongSongNotFound(t *testing.T) {
 // TestDeletePlaylistOrphanCleanup 验证删除歌单时的孤儿歌曲清理语义（issue #325）：
 //   - 仅属于被删歌单的歌曲（remote / local）被清理；
 //   - 被其他歌单或内置收藏引用的歌曲保留；
-//   - 本地孤儿歌曲 deleteFiles=true 时磁盘文件被删；
+//   - 本地孤儿歌曲磁盘文件保留（永不删除音频文件）；
 //
 // 复刻 handler 编排：删前收集歌单歌曲 ID → 删歌单 → DeleteOrphanSongs。
 func TestDeletePlaylistOrphanCleanup(t *testing.T) {
@@ -707,7 +707,7 @@ func TestDeletePlaylistOrphanCleanup(t *testing.T) {
 		t.Fatalf("create playlist B: %v", err)
 	}
 
-	// 本地孤儿歌曲：准备一个真实临时文件，验证 deleteFiles=true 会删磁盘文件。
+	// 本地孤儿歌曲：准备真实临时文件，验证删库后文件仍在。
 	localFile := filepath.Join(t.TempDir(), "orphan.mp3")
 	if err := os.WriteFile(localFile, []byte("dummy"), 0644); err != nil {
 		t.Fatalf("write local file: %v", err)
@@ -771,9 +771,9 @@ func TestDeletePlaylistOrphanCleanup(t *testing.T) {
 	assertKept(sharedRemote.ID, "共享网络歌")
 	assertKept(favRemote.ID, "收藏网络歌")
 
-	// 本地孤儿磁盘文件应被删除。
-	if _, err := os.Stat(localFile); !os.IsNotExist(err) {
-		t.Errorf("local orphan file should be deleted, stat err = %v", err)
+	// 本地孤儿磁盘文件必须保留。
+	if _, err := os.Stat(localFile); err != nil {
+		t.Errorf("local orphan file must never be deleted, stat err = %v", err)
 	}
 }
 
